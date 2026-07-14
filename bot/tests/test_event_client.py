@@ -22,7 +22,24 @@ def test_send_download_start_no_raise():
     ))
 
 
-def test_send_progress_no_raise():
+def test_send_progress_uses_flat_download_progress_payload(monkeypatch):
+    captured = {}
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            pass
+
+        async def post(self, url, json):
+            captured.update(json)
+
+    monkeypatch.setattr(event_client.httpx, "AsyncClient", FakeAsyncClient)
+
     asyncio.run(event_client.send_progress(
         job_id="job-1",
         percent=42.5,
@@ -31,6 +48,15 @@ def test_send_progress_no_raise():
         downloaded_bytes=10485760,
         total_bytes=25165824,
     ))
+
+    assert captured["type"] == "download_progress"
+    assert captured["job_id"] == "job-1"
+    assert captured["percent"] == 42.5
+    assert captured["speed"] == 1024000.0
+    assert captured["eta"] == 30.0
+    assert captured["downloaded_bytes"] == 10485760
+    assert captured["total_bytes"] == 25165824
+    assert "data" not in captured
 
 
 def test_send_download_done_no_raise():

@@ -51,87 +51,87 @@ def _login() -> dict:
 def test_event_download_start():
     resp = client.post("/api/events", json={
         "type": "download_start",
-        "data": {
-            "job_id": "job-start-1",
-            "user_id": 42,
-            "username": "alice",
-            "chat_id": 99,
-            "url": "https://example.com/video.mp4",
-            "platform": "youtube",
-        },
+        "job_id": "job-start-1",
+        "user_id": 42,
+        "username": "alice",
+        "chat_id": 99,
+        "url": "https://example.com/video.mp4",
+        "platform": "youtube",
+        "format": "video",
+        "quality": "best",
+        "title": "Test Video",
     })
-    assert resp.status_code == 204
+    assert resp.status_code == 200
 
 
 def test_event_download_progress():
     # Start one first
     client.post("/api/events", json={
         "type": "download_start",
-        "data": {
-            "job_id": "job-progress-1",
-            "user_id": 1,
-            "username": "bob",
-            "chat_id": 1,
-            "url": "https://example.com/v.mp4",
-        },
+        "job_id": "job-progress-1",
+        "user_id": 1,
+        "username": "bob",
+        "chat_id": 1,
+        "url": "https://example.com/v.mp4",
+        "platform": "youtube",
+        "format": "video",
+        "quality": "best",
+        "title": "Progress Video",
     })
     resp = client.post("/api/events", json={
         "type": "download_progress",
-        "data": {
-            "job_id": "job-progress-1",
-            "progress": 50.0,
-            "speed": "1 MB/s",
-            "eta": "5s",
-        },
+        "job_id": "job-progress-1",
+        "percent": 50.0,
+        "speed": 1048576.0,
+        "eta": 5.0,
+        "downloaded_bytes": 524288,
+        "total_bytes": 1048576,
     })
-    assert resp.status_code == 204
+    assert resp.status_code == 200
 
 
 def test_event_download_done():
     client.post("/api/events", json={
         "type": "download_start",
-        "data": {
-            "job_id": "job-done-1",
-            "user_id": 2,
-            "username": "carol",
-            "chat_id": 2,
-            "url": "https://example.com/done.mp4",
-            "platform": "tiktok",
-        },
+        "job_id": "job-done-1",
+        "user_id": 2,
+        "username": "carol",
+        "chat_id": 2,
+        "url": "https://example.com/done.mp4",
+        "platform": "tiktok",
+        "format": "video",
+        "quality": "1080p",
+        "title": "My Video",
     })
     resp = client.post("/api/events", json={
         "type": "download_done",
-        "data": {
-            "job_id": "job-done-1",
-            "title": "My Video",
-            "format": "mp4",
-            "quality": "1080p",
-            "file_size_bytes": 1024000,
-            "download_duration_sec": 3.5,
-        },
+        "job_id": "job-done-1",
+        "file_size_bytes": 1024000,
+        "duration_seconds": 3.5,
+        "filename": "video.mp4",
     })
-    assert resp.status_code == 204
+    assert resp.status_code == 200
 
 
 def test_event_download_error():
     client.post("/api/events", json={
         "type": "download_start",
-        "data": {
-            "job_id": "job-err-1",
-            "user_id": 3,
-            "username": "dave",
-            "chat_id": 3,
-            "url": "https://example.com/err.mp4",
-        },
+        "job_id": "job-err-1",
+        "user_id": 3,
+        "username": "dave",
+        "chat_id": 3,
+        "url": "https://example.com/err.mp4",
+        "platform": "youtube",
+        "format": "video",
+        "quality": "best",
+        "title": "Error Video",
     })
     resp = client.post("/api/events", json={
         "type": "download_error",
-        "data": {
-            "job_id": "job-err-1",
-            "error_message": "HTTP 403 forbidden",
-        },
+        "job_id": "job-err-1",
+        "error_message": "HTTP 403 forbidden",
     })
-    assert resp.status_code == 204
+    assert resp.status_code == 200
 
 
 # ---------------------------------------------------------------------------
@@ -189,14 +189,15 @@ def test_active_downloads_with_auth():
     # Start a job to make sure at least one is active
     client.post("/api/events", json={
         "type": "download_start",
-        "data": {
-            "job_id": "job-active-1",
-            "user_id": 10,
-            "username": "eve",
-            "chat_id": 10,
-            "url": "https://example.com/active.mp4",
-            "platform": "instagram",
-        },
+        "job_id": "job-active-1",
+        "user_id": 10,
+        "username": "eve",
+        "chat_id": 10,
+        "url": "https://example.com/active.mp4",
+        "platform": "instagram",
+        "format": "video",
+        "quality": "best",
+        "title": "Active Video",
     })
     cookies = _login()
     resp = client.get("/api/active-downloads", cookies=cookies)

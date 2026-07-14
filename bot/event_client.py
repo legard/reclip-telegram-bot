@@ -55,7 +55,7 @@ async def send_progress(
 ) -> None:
     try:
         payload = {
-            "type": "progress",
+            "type": "download_progress",
             "ts": _now_iso(),
             "job_id": job_id,
             "percent": percent,
