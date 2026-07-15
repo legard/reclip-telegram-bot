@@ -31,6 +31,20 @@ async def wait_for_bot_api(url: str, max_wait: int = 60):
     logger.warning("Bot API server not reachable after %ds, starting anyway", max_wait)
 
 
+def build_application(bot_token: str, api_url: str):
+    return (
+        ApplicationBuilder()
+        .token(bot_token)
+        .base_url(f"{api_url}/bot")
+        .base_file_url(f"{api_url}/file/bot")
+        .local_mode(True)
+        .read_timeout(60)
+        .write_timeout(60)
+        .connect_timeout(30)
+        .build()
+    )
+
+
 def main():
     bot_token = os.environ.get("BOT_TOKEN")
     if not bot_token:
@@ -38,23 +52,12 @@ def main():
         sys.exit(1)
 
     api_url = os.environ.get("TELEGRAM_BOT_API_URL", "http://telegram-bot-api:8081")
-    base_url = f"{api_url}/bot"
-    base_file_url = f"{api_url}/file/bot"
 
     logger.info("Starting bot with API server: %s", api_url)
 
     asyncio.get_event_loop().run_until_complete(wait_for_bot_api(api_url))
 
-    app = (
-        ApplicationBuilder()
-        .token(bot_token)
-        .base_url(base_url)
-        .base_file_url(base_file_url)
-        .read_timeout(60)
-        .write_timeout(60)
-        .connect_timeout(30)
-        .build()
-    )
+    app = build_application(bot_token, api_url)
 
     register_handlers(app)
 
