@@ -81,3 +81,14 @@ def test_empty_directory(tmp_path):
 def test_nonexistent_directory():
     cleanup.DOWNLOADS_PATH = Path("/nonexistent/path")
     cleanup._run_cleanup()
+
+
+def test_zero_disables_size_based_cleanup(tmp_path):
+    media = tmp_path / "large.mp4"
+    media.write_bytes(b"x" * 1024)
+
+    cleanup.DOWNLOADS_PATH = tmp_path
+    cleanup.CLEANUP_MAX_DISK_MB = 0
+    cleanup._enforce_disk_limit()
+
+    assert media.exists()

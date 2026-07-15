@@ -49,6 +49,8 @@ def _run_cleanup():
 
 
 def _enforce_disk_limit():
+    if CLEANUP_MAX_DISK_MB == 0:
+        return
     if not DOWNLOADS_PATH.exists():
         return
 
