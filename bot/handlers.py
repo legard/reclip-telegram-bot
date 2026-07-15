@@ -19,6 +19,7 @@ from reclip_client import (
     start_download,
 )
 import event_client
+from upload import TelegramUploadError, send_local_path
 
 logger = logging.getLogger(__name__)
 
@@ -303,47 +304,35 @@ async def _direct_download(update: Update, status_msg, url: str, fmt: str, forma
         await event_client.send_download_error(job_id=job_id, error_message="File not found after download")
         return
 
-    for attempt in range(2):
-        try:
-            with open(local_path, "rb") as f:
-                if fmt == "video" and local_path.suffix.lower() == ".mp4":
-                    dur = video_meta.get("duration")
-                    await update.message.chat.send_video(
-                        video=f,
-                        caption=_truncate_caption(title),
-                        supports_streaming=True,
-                        width=video_meta.get("width"),
-                        height=video_meta.get("height"),
-                        duration=int(dur) if dur else None,
-                    )
-                else:
-                    await update.message.chat.send_document(document=f, caption=_truncate_caption(title))
-            _stats["downloads"] += 1
-            try:
-                await event_client.send_download_done(
-                    job_id=job_id,
-                    file_size_bytes=local_path.stat().st_size,
-                    duration_seconds=time.time() - _direct_download_start,
-                    filename=local_path.name,
-                )
-            except Exception:
-                pass
-            break
-        except Exception:
-            if attempt == 0:
-                await asyncio.sleep(1)
-            else:
-                await _edit_safe(status_msg, "Failed to upload file to Telegram.")
-                _stats["errors"] += 1
-                await event_client.send_download_error(job_id=job_id, error_message="Failed to upload to Telegram")
-                return
+    try:
+        file_size = await send_local_path(
+            update.message.chat,
+            local_path,
+            caption=_truncate_caption(title),
+            video_meta=video_meta if fmt == "video" else None,
+        )
+    except TelegramUploadError:
+        logger.exception("Upload failed after retry")
+        await _edit_safe(status_msg, "Failed to upload file to Telegram.")
+        _stats["errors"] += 1
+        await event_client.send_download_error(
+            job_id=job_id, error_message="Failed to upload to Telegram"
+        )
+        return
+
+    _stats["downloads"] += 1
+    try:
+        await event_client.send_download_done(
+            job_id=job_id,
+            file_size_bytes=file_size,
+            duration_seconds=time.time() - _direct_download_start,
+            filename=local_path.name,
+        )
+    except Exception:
+        pass
 
     try:
         await status_msg.edit_text(f"Sent: {title}")
-    except Exception:
-        pass
-    try:
-        local_path.unlink()
     except Exception:
         pass
 
@@ -654,42 +643,32 @@ async def download_and_send(query, entry: dict, format: str, format_id: str | No
         await event_client.send_download_error(job_id=job_id, error_message="File not found after download")
         return
 
-    for attempt in range(2):
-        try:
-            with open(local_path, "rb") as f:
-                if format == "video" and local_path.suffix.lower() == ".mp4":
-                    dur = video_meta.get("duration")
-                    await query.message.chat.send_video(
-                        video=f,
-                        caption=_truncate_caption(title),
-                        supports_streaming=True,
-                        width=video_meta.get("width"),
-                        height=video_meta.get("height"),
-                        duration=int(dur) if dur else None,
-                    )
-                else:
-                    await query.message.chat.send_document(document=f, caption=_truncate_caption(title))
-            _stats["downloads"] += 1
-            try:
-                await event_client.send_download_done(
-                    job_id=job_id,
-                    file_size_bytes=local_path.stat().st_size,
-                    duration_seconds=time.time() - entry["created"],
-                    filename=local_path.name,
-                )
-            except Exception:
-                pass
-            break
-        except Exception:
-            if attempt == 0:
-                logger.warning("Upload failed, retrying once")
-                await asyncio.sleep(1)
-            else:
-                logger.exception("Upload failed after retry")
-                await _edit_safe(message, "Failed to upload file to Telegram.")
-                _stats["errors"] += 1
-                await event_client.send_download_error(job_id=job_id, error_message="Failed to upload to Telegram")
-                return
+    try:
+        file_size = await send_local_path(
+            query.message.chat,
+            local_path,
+            caption=_truncate_caption(title),
+            video_meta=video_meta if format == "video" else None,
+        )
+    except TelegramUploadError:
+        logger.exception("Upload failed after retry")
+        await _edit_safe(message, "Failed to upload file to Telegram.")
+        _stats["errors"] += 1
+        await event_client.send_download_error(
+            job_id=job_id, error_message="Failed to upload to Telegram"
+        )
+        return
+
+    _stats["downloads"] += 1
+    try:
+        await event_client.send_download_done(
+            job_id=job_id,
+            file_size_bytes=file_size,
+            duration_seconds=time.time() - entry["created"],
+            filename=local_path.name,
+        )
+    except Exception:
+        pass
 
     try:
         sent_text = _truncate_caption(f"Sent: {title}")
@@ -699,12 +678,6 @@ async def download_and_send(query, entry: dict, format: str, format_id: str | No
             await message.edit_text(sent_text)
     except Exception:
         pass
-
-    try:
-        local_path.unlink()
-    except Exception:
-        logger.debug("Could not delete %s", local_path)
-
 
 async def _edit_safe(message, text: str):
     try:
