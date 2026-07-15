@@ -17,6 +17,14 @@ def load_yaml(path: Path) -> dict:
         return yaml.safe_load(f)
 
 
+def _build_step(workflow):
+    return next(
+        step
+        for step in workflow["jobs"]["build-and-push"]["steps"]
+        if step.get("uses", "").startswith("docker/build-push-action@")
+    )
+
+
 # ---------------------------------------------------------------------------
 # Test 1: YAML parsing
 # ---------------------------------------------------------------------------
@@ -110,8 +118,8 @@ class TestImageTagPattern:
         assert ":${{ steps.version.outputs.version }}" in tags_raw, (
             f"workflow tags must include ':${{{{ steps.version.outputs.version }}}}', got:\n{tags_raw}"
         )
-        assert ":latest" in tags_raw, (
-            f"workflow tags must include ':latest', got:\n{tags_raw}"
+        assert ":latest" not in tags_raw, (
+            f"workflow tags must not include ':latest', got:\n{tags_raw}"
         )
 
 
@@ -127,3 +135,26 @@ class TestPrereleaseSkip:
         assert "!github.event.release.prerelease" in job["if"], (
             f"job 'if' must check '!github.event.release.prerelease', got {job['if']!r}"
         )
+
+
+def test_release_waits_for_tests():
+    workflow = load_yaml(WORKFLOW_PATH)
+    job = workflow["jobs"]["build-and-push"]
+    assert job["needs"] == "test"
+    assert "github.event_name == 'release'" in job["if"]
+
+
+def test_release_is_amd64_and_immutable():
+    workflow = load_yaml(WORKFLOW_PATH)
+    values = _build_step(workflow)["with"]
+    assert values["platforms"] == "linux/amd64"
+    assert ":${{ steps.version.outputs.version }}" in values["tags"]
+    assert ":sha-${{ github.sha }}" in values["tags"]
+    assert ":latest" not in values["tags"]
+
+
+def test_release_has_source_and_revision_labels():
+    workflow = load_yaml(WORKFLOW_PATH)
+    labels = _build_step(workflow)["with"]["labels"]
+    assert "org.opencontainers.image.source=https://github.com/${{ github.repository }}" in labels
+    assert "org.opencontainers.image.revision=${{ github.sha }}" in labels
