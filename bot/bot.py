@@ -8,11 +8,33 @@ from telegram.ext import ApplicationBuilder
 from cleanup import cleanup_loop
 from handlers import register_handlers
 
-logging.basicConfig(
-    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
-    level=logging.INFO,
-)
+LOG_FORMAT = "%(asctime)s [%(name)s] %(levelname)s: %(message)s"
 logger = logging.getLogger(__name__)
+
+
+class SecretRedactingFormatter(logging.Formatter):
+    def __init__(self, *secrets: str):
+        super().__init__(LOG_FORMAT)
+        self._secrets = tuple(secret for secret in secrets if secret)
+
+    def format(self, record: logging.LogRecord) -> str:
+        rendered = super().format(record)
+        for secret in self._secrets:
+            rendered = rendered.replace(secret, "[REDACTED]")
+        return rendered
+
+
+def configure_logging(bot_token: str | None) -> None:
+    logging.basicConfig(level=logging.INFO, force=True)
+    formatter = SecretRedactingFormatter(bot_token or "")
+    for handler in logging.getLogger().handlers:
+        handler.setFormatter(formatter)
+
+    # HTTP clients include full request URLs in routine logs. Telegram request
+    # URLs contain the bot token, so keep those libraries above INFO while the
+    # formatter remains a second line of defence for warnings and tracebacks.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 async def wait_for_bot_api(url: str, max_wait: int = 60):
@@ -47,6 +69,7 @@ def build_application(bot_token: str, api_url: str):
 
 def main():
     bot_token = os.environ.get("BOT_TOKEN")
+    configure_logging(bot_token)
     if not bot_token:
         logger.error("BOT_TOKEN environment variable is required")
         sys.exit(1)
