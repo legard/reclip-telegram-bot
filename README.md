@@ -101,7 +101,7 @@ All configuration is via environment variables in `.env`:
 | `TELEGRAM_API_HASH` | (required) | Telegram API hash from my.telegram.org |
 | `MAX_CONCURRENT_DOWNLOADS` | 3 | Max parallel downloads |
 | `CLEANUP_MAX_AGE_HOURS` | 1 | Delete files older than this |
-| `CLEANUP_MAX_DISK_MB` | 0 | Max disk usage before cleanup; `0` disables size cleanup while age cleanup remains active |
+| `CLEANUP_MAX_DISK_MB` | 5000 | Max disk usage before cleanup; `0` disables size cleanup while age cleanup remains active |
 | `CLEANUP_INTERVAL_SECONDS` | 300 | Cleanup check interval |
 | `DASHBOARD_USER` | admin | Dashboard login username |
 | `DASHBOARD_PASSWORD` | (required) | Dashboard login password |
