@@ -102,6 +102,15 @@ def summarize_download_error(diagnostics):
     return summary[-DOWNLOAD_ERROR_CHAR_LIMIT:]
 
 
+def run_ffmpeg(command, timeout):
+    return subprocess.run(
+        command,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=timeout,
+    )
+
+
 def run_download(job_id, url, format_choice, format_id):
     job = jobs[job_id]
 
@@ -199,13 +208,13 @@ def _do_download(job_id, url, format_choice, format_id):
             if vcodec in ("av1", "vp9", "vp8"):
                 transcoded = chosen + ".h264.mp4"
                 try:
-                    r = subprocess.run(
+                    r = run_ffmpeg(
                         ["ffmpeg", "-y", "-i", chosen,
                          "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
                          "-c:a", "aac", "-b:a", "128k",
                          "-movflags", "+faststart",
                          transcoded],
-                        capture_output=True, timeout=600,
+                        timeout=600,
                     )
                     if r.returncode == 0 and os.path.exists(transcoded) and os.path.getsize(transcoded) > 0:
                         os.replace(transcoded, chosen)
@@ -218,10 +227,10 @@ def _do_download(job_id, url, format_choice, format_id):
             else:
                 faststart_tmp = chosen + ".fs.mp4"
                 try:
-                    subprocess.run(
+                    run_ffmpeg(
                         ["ffmpeg", "-y", "-i", chosen, "-c", "copy",
                          "-movflags", "+faststart", faststart_tmp],
-                        capture_output=True, timeout=120,
+                        timeout=120,
                     )
                     if os.path.exists(faststart_tmp) and os.path.getsize(faststart_tmp) > 0:
                         os.replace(faststart_tmp, chosen)

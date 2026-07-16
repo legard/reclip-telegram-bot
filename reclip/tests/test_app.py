@@ -1,4 +1,5 @@
 from collections import deque
+from types import SimpleNamespace
 
 from reclip import app
 
@@ -13,6 +14,26 @@ def test_download_command_limits_fragment_concurrency():
 
     fragments_index = command.index("--concurrent-fragments")
     assert command[fragments_index + 1] == "2"
+
+
+def test_ffmpeg_runner_discards_process_output(monkeypatch):
+    captured = {}
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(app.subprocess, "run", fake_run)
+
+    result = app.run_ffmpeg(["ffmpeg", "-version"], timeout=30)
+
+    assert result.returncode == 0
+    assert captured["kwargs"] == {
+        "stdout": app.subprocess.DEVNULL,
+        "stderr": app.subprocess.DEVNULL,
+        "timeout": 30,
+    }
 
 
 def test_progress_lines_do_not_fill_diagnostic_buffer():
