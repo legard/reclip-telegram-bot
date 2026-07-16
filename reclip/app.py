@@ -26,9 +26,12 @@ PROGRESS_TEMPLATE = (
 )
 
 DOWNLOAD_DIAGNOSTIC_LINE_LIMIT = 20
+DOWNLOAD_DIAGNOSTIC_CHAR_LIMIT = 2048
 DOWNLOAD_ERROR_CHAR_LIMIT = 1500
 URL_PATTERN = re.compile(r"https?://\S+", re.IGNORECASE)
-TOKEN_PATTERN = re.compile(r"\b\d{6,}:[A-Za-z0-9_-]{20,}\b")
+TOKEN_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9_-])\d{6,}:[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_-])"
+)
 
 
 def build_download_command(job_id, url, format_choice, format_id):
@@ -80,6 +83,11 @@ def record_download_output(job, diagnostics, line):
         except (json.JSONDecodeError, TypeError, ValueError):
             pass
 
+    if len(line) > DOWNLOAD_DIAGNOSTIC_CHAR_LIMIT:
+        marker = "...[truncated]..."
+        prefix_length = (DOWNLOAD_DIAGNOSTIC_CHAR_LIMIT - len(marker)) // 2
+        suffix_length = DOWNLOAD_DIAGNOSTIC_CHAR_LIMIT - len(marker) - prefix_length
+        line = line[:prefix_length] + marker + line[-suffix_length:]
     diagnostics.append(line)
 
 
