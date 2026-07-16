@@ -24,8 +24,11 @@ jobs:
 
       - name: Install test dependencies
         run: |
-          python -m pip install -r bot/requirements.txt -r dashboard/requirements.txt
+          python -m pip install -r reclip/requirements.txt -r bot/requirements.txt -r dashboard/requirements.txt
           python -m pip install pytest pytest-asyncio pyyaml httpx
+
+      - name: Run ReClip tests
+        run: python -m pytest reclip/tests -v
 
       - name: Run bot tests
         run: python -m pytest bot/tests -v

@@ -144,6 +144,15 @@ def test_release_waits_for_tests():
     assert "github.event_name == 'release'" in job["if"]
 
 
+def test_release_runs_reclip_tests_and_installs_requirements():
+    workflow = load_yaml(WORKFLOW_PATH)
+    steps = workflow["jobs"]["test"]["steps"]
+    commands = "\n".join(step.get("run", "") for step in steps)
+
+    assert "-r reclip/requirements.txt" in commands
+    assert "python -m pytest reclip/tests -v" in commands
+
+
 def test_release_is_amd64_and_immutable():
     workflow = load_yaml(WORKFLOW_PATH)
     values = _build_step(workflow)["with"]

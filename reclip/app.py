@@ -2,8 +2,10 @@ import os
 import uuid
 import glob
 import json
+import re
 import subprocess
 import threading
+from collections import deque
 from flask import Flask, request, jsonify, send_file, render_template
 
 app = Flask(__name__)
@@ -23,6 +25,74 @@ PROGRESS_TEMPLATE = (
     '"eta":%(progress.eta)s}'
 )
 
+DOWNLOAD_DIAGNOSTIC_LINE_LIMIT = 20
+DOWNLOAD_ERROR_CHAR_LIMIT = 1500
+URL_PATTERN = re.compile(r"https?://\S+", re.IGNORECASE)
+TOKEN_PATTERN = re.compile(r"\b\d{6,}:[A-Za-z0-9_-]{20,}\b")
+
+
+def build_download_command(job_id, url, format_choice, format_id):
+    out_template = os.path.join(DOWNLOAD_DIR, f"{job_id}.%(ext)s")
+    command = [
+        "yt-dlp", "--no-playlist", "-o", out_template,
+        "--progress-template", PROGRESS_TEMPLATE,
+        "--force-ipv4",
+        "--downloader", "hls:ffmpeg",
+        "--concurrent-fragments", "2",
+        "--socket-timeout", "20",
+        "--retries", "5",
+        "--fragment-retries", "10",
+        "--throttled-rate", "50K",
+    ]
+
+    if format_choice == "audio":
+        command += ["-x", "--audio-format", "mp3"]
+    elif format_id:
+        command += ["-f", f"{format_id}+bestaudio/best", "--merge-output-format", "mp4"]
+    else:
+        command += ["-f", "bv*[vcodec~='^(avc|h264)']+ba/b[vcodec~='^(avc|h264)']/bv*+ba/b", "--merge-output-format", "mp4"]
+
+    command.append(url)
+    return command
+
+
+def record_download_output(job, diagnostics, line):
+    if line.startswith("download:"):
+        try:
+            progress_data = json.loads(line.removeprefix("download:"))
+            total = progress_data.get("total_bytes")
+            downloaded = progress_data.get("downloaded_bytes")
+            percent = None
+            if (
+                isinstance(total, (int, float))
+                and isinstance(downloaded, (int, float))
+                and total > 0
+            ):
+                percent = round(downloaded / total * 100, 1)
+            job["progress"] = {
+                "percent": percent,
+                "downloaded_bytes": downloaded,
+                "total_bytes": total,
+                "speed": progress_data.get("speed"),
+                "eta": progress_data.get("eta"),
+            }
+            return
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+
+    diagnostics.append(line)
+
+
+def summarize_download_error(diagnostics):
+    lines = list(diagnostics)[-DOWNLOAD_DIAGNOSTIC_LINE_LIMIT:]
+    if not lines:
+        return "Download failed"
+
+    summary = "\n".join(lines)
+    summary = URL_PATTERN.sub("[URL]", summary)
+    summary = TOKEN_PATTERN.sub("[TOKEN]", summary)
+    return summary[-DOWNLOAD_ERROR_CHAR_LIMIT:]
+
 
 def run_download(job_id, url, format_choice, format_id):
     job = jobs[job_id]
@@ -40,28 +110,7 @@ def run_download(job_id, url, format_choice, format_id):
 
 def _do_download(job_id, url, format_choice, format_id):
     job = jobs[job_id]
-    out_template = os.path.join(DOWNLOAD_DIR, f"{job_id}.%(ext)s")
-
-    cmd = [
-        "yt-dlp", "--no-playlist", "-o", out_template,
-        "--progress-template", PROGRESS_TEMPLATE,
-        "--force-ipv4",
-        "--downloader", "hls:ffmpeg",
-        "--concurrent-fragments", "4",
-        "--socket-timeout", "20",
-        "--retries", "5",
-        "--fragment-retries", "10",
-        "--throttled-rate", "50K",
-    ]
-
-    if format_choice == "audio":
-        cmd += ["-x", "--audio-format", "mp3"]
-    elif format_id:
-        cmd += ["-f", f"{format_id}+bestaudio/best", "--merge-output-format", "mp4"]
-    else:
-        cmd += ["-f", "bv*[vcodec~='^(avc|h264)']+ba/b[vcodec~='^(avc|h264)']/bv*+ba/b", "--merge-output-format", "mp4"]
-
-    cmd.append(url)
+    cmd = build_download_command(job_id, url, format_choice, format_id)
 
     process = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
@@ -80,29 +129,12 @@ def _do_download(job_id, url, format_choice, format_id):
     deadline_timer.daemon = True
     deadline_timer.start()
 
-    stderr_lines = []
+    stderr_lines = deque(maxlen=DOWNLOAD_DIAGNOSTIC_LINE_LIMIT)
 
     def _read_stderr():
         for line in process.stderr:
             line = line.rstrip("\n")
-            stderr_lines.append(line)
-            try:
-                json_str = line.removeprefix("download:")
-                progress_data = json.loads(json_str)
-                total = progress_data.get("total_bytes")
-                downloaded = progress_data.get("downloaded_bytes")
-                percent = None
-                if total and downloaded and total > 0:
-                    percent = round(downloaded / total * 100, 1)
-                job["progress"] = {
-                    "percent": percent,
-                    "downloaded_bytes": downloaded,
-                    "total_bytes": total,
-                    "speed": progress_data.get("speed"),
-                    "eta": progress_data.get("eta"),
-                }
-            except (json.JSONDecodeError, ValueError):
-                pass
+            record_download_output(job, stderr_lines, line)
 
     stderr_reader = threading.Thread(target=_read_stderr, daemon=True)
     stderr_reader.start()
@@ -121,8 +153,7 @@ def _do_download(job_id, url, format_choice, format_id):
     try:
         if returncode != 0:
             job["status"] = "error"
-            last_line = stderr_lines[-1] if stderr_lines else "Unknown error"
-            job["error"] = last_line
+            job["error"] = summarize_download_error(stderr_lines)
             return
 
         files = glob.glob(os.path.join(DOWNLOAD_DIR, f"{job_id}.*"))
