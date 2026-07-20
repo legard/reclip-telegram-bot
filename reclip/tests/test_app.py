@@ -1,5 +1,8 @@
 from collections import deque
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+
+import pytest
 
 from reclip import app
 
@@ -92,3 +95,139 @@ def test_error_summary_is_bounded_useful_and_redacted():
 
 def test_empty_error_summary_has_safe_fallback():
     assert app.summarize_download_error([]) == "Download failed"
+
+
+def test_status_exposes_active_stage_and_deadline_fields():
+    job_id = "active-job"
+    started_at = datetime.now(timezone.utc).isoformat()
+    deadline_at = (datetime.now(timezone.utc) + timedelta(minutes=150)).isoformat()
+    app.jobs[job_id] = {
+        "status": "downloading",
+        "stage": "downloading",
+        "started_at": started_at,
+        "deadline_at": deadline_at,
+    }
+
+    try:
+        response = app.app.test_client().get(f"/api/status/{job_id}")
+    finally:
+        app.jobs.pop(job_id, None)
+
+    assert response.status_code == 200
+    assert response.json["stage"] == "downloading"
+    assert response.json["started_at"] == started_at
+    assert response.json["deadline_at"] == deadline_at
+
+
+@pytest.mark.parametrize("stage", ["downloading", "postprocessing"])
+def test_expired_job_terminates_process_group_and_removes_all_job_files(monkeypatch, tmp_path, stage):
+    class Process:
+        pid = 4242
+
+        def wait(self, timeout):
+            raise app.subprocess.TimeoutExpired("yt-dlp", timeout)
+
+    signals = []
+    monkeypatch.setattr(app, "DOWNLOAD_DIR", str(tmp_path))
+    monkeypatch.setattr(app.os, "killpg", lambda pid, sig: signals.append((pid, sig)))
+    for name in ("job-1.mp4", "job-1.part", "other-job.mp4"):
+        (tmp_path / name).write_text("data")
+    job = {
+        "job_id": "job-1",
+        "status": "downloading",
+        "stage": stage,
+        "_timed_out": app.threading.Event(),
+        "_process_lock": app.threading.Lock(),
+        "_active_process": Process(),
+    }
+
+    app.expire_job(job)
+
+    assert job["status"] == "error"
+    assert job["stage"] is None
+    assert job["error"] == f"Job timed out after 150 minutes during {stage}."
+    assert signals == [
+        (4242, app.signal.SIGTERM),
+        (4242, app.signal.SIGKILL),
+    ]
+    assert not (tmp_path / "job-1.mp4").exists()
+    assert not (tmp_path / "job-1.part").exists()
+    assert (tmp_path / "other-job.mp4").exists()
+
+
+def test_job_processes_start_in_a_separate_process_group(monkeypatch):
+    captured = {}
+    fake_process = SimpleNamespace(pid=12)
+
+    def fake_popen(command, **kwargs):
+        captured.update(kwargs)
+        return fake_process
+
+    monkeypatch.setattr(app.subprocess, "Popen", fake_popen)
+    job = {
+        "_process_lock": app.threading.Lock(),
+        "_timed_out": app.threading.Event(),
+    }
+
+    assert app._start_job_process(job, ["ffmpeg", "-version"]) is fake_process
+    assert captured["start_new_session"] is True
+
+
+def test_download_slot_is_released_after_job_finishes(monkeypatch):
+    class Semaphore:
+        def __init__(self):
+            self.released = 0
+
+        def acquire(self, timeout):
+            return True
+
+        def release(self):
+            self.released += 1
+
+    semaphore = Semaphore()
+    app.jobs["job-1"] = {"status": "downloading"}
+    monkeypatch.setattr(app, "download_semaphore", semaphore)
+    monkeypatch.setattr(app, "_do_download", lambda *args: None)
+
+    try:
+        app.run_download("job-1", "https://example.com/video", "video", None)
+    finally:
+        app.jobs.pop("job-1", None)
+
+    assert semaphore.released == 1
+
+
+def test_download_start_failure_finalizes_job_and_cancels_deadline_timer(monkeypatch):
+    class Timer:
+        cancelled = False
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+        def cancel(self):
+            self.cancelled = True
+
+    job = {
+        "job_id": "job-1",
+        "status": "downloading",
+        "stage": "downloading",
+        "_started_monotonic": app.time.monotonic(),
+        "_deadline_monotonic": app.time.monotonic() + 100,
+        "_timed_out": app.threading.Event(),
+        "_process_lock": app.threading.Lock(),
+        "_active_process": None,
+    }
+    app.jobs["job-1"] = job
+    monkeypatch.setattr(app.threading, "Timer", Timer)
+    monkeypatch.setattr(app.subprocess, "Popen", lambda *args, **kwargs: (_ for _ in ()).throw(OSError()))
+
+    try:
+        app._do_download("job-1", "https://example.com/video", "video", None)
+    finally:
+        app.jobs.pop("job-1", None)
+
+    assert job["status"] == "error"
+    assert job["error"] == "Download failed"

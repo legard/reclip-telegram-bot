@@ -52,6 +52,7 @@ async def send_progress(
     eta: float | None,
     downloaded_bytes: int | None,
     total_bytes: int | None,
+    stage: str | None = None,
 ) -> None:
     try:
         payload = {
@@ -63,6 +64,7 @@ async def send_progress(
             "eta": eta,
             "downloaded_bytes": downloaded_bytes,
             "total_bytes": total_bytes,
+            "stage": stage,
         }
         async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
             await client.post(f"{DASHBOARD_URL}/api/events", json=payload)

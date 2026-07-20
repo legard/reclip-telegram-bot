@@ -13,6 +13,9 @@ from reclip_client import (
     ReclipDownloadError,
     ReclipServiceDown,
     ReclipError,
+    ReclipJobLost,
+    ReclipServiceOutage,
+    wait_for_job,
 )
 
 
@@ -171,3 +174,58 @@ class TestPollStatus:
 
             result = await poll_status("abc1234567")
             assert result["status"] == "error"
+
+    @pytest.mark.asyncio
+    async def test_not_found_means_job_was_lost_after_service_restart(self, mock_response):
+        resp = mock_response(404)
+        with patch("reclip_client._client") as mock_client:
+            client = AsyncMock()
+            client.__aenter__ = AsyncMock(return_value=client)
+            client.__aexit__ = AsyncMock(return_value=False)
+            client.get = AsyncMock(return_value=resp)
+            mock_client.return_value = client
+
+            with pytest.raises(ReclipJobLost, match="service restarted"):
+                await poll_status("abc1234567")
+
+
+class TestWaitForJob:
+    @pytest.mark.asyncio
+    async def test_waits_past_450_downloading_responses_until_done(self, monkeypatch):
+        responses = [
+            {
+                "status": "downloading",
+                "stage": "downloading",
+                "deadline_at": "2099-01-01T00:00:00+00:00",
+            }
+            for _ in range(451)
+        ]
+        responses.append({"status": "done", "file_path": "/downloads/video.mp4"})
+
+        async def fake_poll_status(job_id):
+            return responses.pop(0)
+
+        async def no_sleep(seconds):
+            assert seconds == 2
+
+        monkeypatch.setattr("reclip_client.poll_status", fake_poll_status)
+
+        result = await wait_for_job("job-1", sleep=no_sleep)
+
+        assert result["status"] == "done"
+        assert responses == []
+
+    @pytest.mark.asyncio
+    async def test_reports_service_outage_after_sixty_seconds(self, monkeypatch):
+        clock = iter([0, 61])
+
+        async def unavailable(job_id):
+            raise ReclipServiceDown("offline")
+
+        async def no_sleep(seconds):
+            pass
+
+        monkeypatch.setattr("reclip_client.poll_status", unavailable)
+
+        with pytest.raises(ReclipServiceOutage, match="more than 60 seconds"):
+            await wait_for_job("job-1", sleep=no_sleep, monotonic=lambda: next(clock))

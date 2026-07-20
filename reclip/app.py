@@ -5,15 +5,23 @@ import json
 import re
 import subprocess
 import threading
+import signal
+import time
+import logging
 from collections import deque
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from flask import Flask, request, jsonify, send_file, render_template
 
 app = Flask(__name__)
+logger = logging.getLogger(__name__)
 DOWNLOAD_DIR = os.environ.get("DOWNLOADS_PATH", os.path.join(os.path.dirname(__file__), "downloads"))
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 MAX_CONCURRENT_DOWNLOADS = int(os.environ.get("MAX_CONCURRENT_DOWNLOADS", 3))
-DOWNLOAD_TIMEOUT = int(os.environ.get("DOWNLOAD_TIMEOUT", 900))
+# DOWNLOAD_TIMEOUT is retained as a backwards-compatible fallback for older
+# deployments. The single job deadline covers download and post-processing.
+JOB_TIMEOUT = int(os.environ.get("JOB_TIMEOUT", os.environ.get("DOWNLOAD_TIMEOUT", 9000)))
 download_semaphore = threading.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 
 jobs = {}
@@ -111,6 +119,101 @@ def run_ffmpeg(command, timeout):
     )
 
 
+def _job_duration(job):
+    started_at = job.get("_started_monotonic")
+    return round(time.monotonic() - started_at, 1) if started_at else None
+
+
+def _log_stage(job, stage):
+    job["stage"] = stage
+    logger.info("job_id=%s stage=%s", job["job_id"], stage)
+
+
+def _log_result(job, result):
+    logger.info(
+        "job_id=%s result=%s duration_seconds=%s",
+        job["job_id"], result, _job_duration(job),
+    )
+
+
+def _cleanup_job_files(job_id):
+    for path in glob.glob(os.path.join(DOWNLOAD_DIR, f"{job_id}.*")):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def _finish_error(job, message):
+    if job.get("status") == "done":
+        return
+    job["status"] = "error"
+    job["stage"] = None
+    job["error"] = message
+    _log_result(job, "error")
+
+
+def _terminate_process_group(process):
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except (ProcessLookupError, OSError):
+        return
+    try:
+        process.wait(timeout=5)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except (ProcessLookupError, OSError):
+        pass
+
+
+def expire_job(job):
+    """Stop the active process group and remove partial output at the job deadline."""
+    if job.get("status") in ("done", "error"):
+        return
+    job["_timed_out"].set()
+    stage = job.get("stage") or "downloading"
+    logger.info("job_id=%s deadline_exceeded stage=%s", job["job_id"], stage)
+    with job["_process_lock"]:
+        process = job.get("_active_process")
+    if process is not None:
+        _terminate_process_group(process)
+    _cleanup_job_files(job["job_id"])
+    _finish_error(job, f"Job timed out after 150 minutes during {stage}.")
+
+
+def _start_job_process(job, command, **kwargs):
+    process = subprocess.Popen(command, start_new_session=True, **kwargs)
+    with job["_process_lock"]:
+        job["_active_process"] = process
+        timed_out = job["_timed_out"].is_set()
+    if timed_out:
+        _terminate_process_group(process)
+    return process
+
+
+def _clear_job_process(job, process):
+    with job["_process_lock"]:
+        if job.get("_active_process") is process:
+            job["_active_process"] = None
+
+
+def _run_job_process(job, command, *, capture_output=False):
+    kwargs = {
+        "stdout": subprocess.PIPE if capture_output else subprocess.DEVNULL,
+        "stderr": subprocess.PIPE if capture_output else subprocess.DEVNULL,
+        "text": True,
+    }
+    process = _start_job_process(job, command, **kwargs)
+    try:
+        stdout, stderr = process.communicate()
+        return SimpleNamespace(returncode=process.returncode, stdout=stdout, stderr=stderr)
+    finally:
+        _clear_job_process(job, process)
+
+
 def run_download(job_id, url, format_choice, format_id):
     job = jobs[job_id]
 
@@ -129,54 +232,42 @@ def _do_download(job_id, url, format_choice, format_id):
     job = jobs[job_id]
     cmd = build_download_command(job_id, url, format_choice, format_id)
 
-    process = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-    )
-
-    timed_out = threading.Event()
-
-    def _kill_on_timeout():
-        timed_out.set()
-        try:
-            process.kill()
-        except Exception:
-            pass
-
-    deadline_timer = threading.Timer(DOWNLOAD_TIMEOUT, _kill_on_timeout)
+    remaining_timeout = max(0, job["_deadline_monotonic"] - time.monotonic())
+    deadline_timer = threading.Timer(remaining_timeout, expire_job, args=(job,))
     deadline_timer.daemon = True
     deadline_timer.start()
 
     stderr_lines = deque(maxlen=DOWNLOAD_DIAGNOSTIC_LINE_LIMIT)
-
-    def _read_stderr():
-        for line in process.stderr:
-            line = line.rstrip("\n")
-            record_download_output(job, stderr_lines, line)
-
-    stderr_reader = threading.Thread(target=_read_stderr, daemon=True)
-    stderr_reader.start()
-
     try:
-        returncode = process.wait()
-    finally:
+        process = _start_job_process(
+            job, cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+        )
+        try:
+            for line in process.stderr:
+                record_download_output(job, stderr_lines, line.rstrip("\n"))
+            returncode = process.wait()
+        finally:
+            _clear_job_process(job, process)
+    except Exception:
+        if not job["_timed_out"].is_set():
+            _finish_error(job, "Download failed")
         deadline_timer.cancel()
-        stderr_reader.join(timeout=5)
+        return
 
-    if timed_out.is_set():
-        job["status"] = "error"
-        job["error"] = f"Download timed out ({DOWNLOAD_TIMEOUT // 60} min limit)"
+    if job["_timed_out"].is_set():
+        deadline_timer.cancel()
         return
 
     try:
         if returncode != 0:
-            job["status"] = "error"
-            job["error"] = summarize_download_error(stderr_lines)
+            _finish_error(job, summarize_download_error(stderr_lines))
+            deadline_timer.cancel()
             return
 
         files = glob.glob(os.path.join(DOWNLOAD_DIR, f"{job_id}.*"))
         if not files:
-            job["status"] = "error"
-            job["error"] = "Download completed but no file was found"
+            _finish_error(job, "Download completed but no file was found")
+            deadline_timer.cancel()
             return
 
         if format_choice == "audio":
@@ -194,12 +285,14 @@ def _do_download(job_id, url, format_choice, format_id):
                     pass
 
         if chosen.endswith(".mp4"):
+            _log_stage(job, "postprocessing")
             try:
-                codec_probe = subprocess.run(
+                codec_probe = _run_job_process(
+                    job,
                     ["ffprobe", "-v", "error", "-select_streams", "v:0",
                      "-show_entries", "stream=codec_name",
                      "-of", "default=noprint_wrappers=1:nokey=1", chosen],
-                    capture_output=True, text=True, timeout=10,
+                    capture_output=True,
                 )
                 vcodec = (codec_probe.stdout or "").strip().lower()
             except Exception:
@@ -208,13 +301,12 @@ def _do_download(job_id, url, format_choice, format_id):
             if vcodec in ("av1", "vp9", "vp8"):
                 transcoded = chosen + ".h264.mp4"
                 try:
-                    r = run_ffmpeg(
+                    r = _run_job_process(job,
                         ["ffmpeg", "-y", "-i", chosen,
                          "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
                          "-c:a", "aac", "-b:a", "128k",
                          "-movflags", "+faststart",
                          transcoded],
-                        timeout=600,
                     )
                     if r.returncode == 0 and os.path.exists(transcoded) and os.path.getsize(transcoded) > 0:
                         os.replace(transcoded, chosen)
@@ -227,10 +319,9 @@ def _do_download(job_id, url, format_choice, format_id):
             else:
                 faststart_tmp = chosen + ".fs.mp4"
                 try:
-                    run_ffmpeg(
+                    _run_job_process(job,
                         ["ffmpeg", "-y", "-i", chosen, "-c", "copy",
                          "-movflags", "+faststart", faststart_tmp],
-                        timeout=120,
                     )
                     if os.path.exists(faststart_tmp) and os.path.getsize(faststart_tmp) > 0:
                         os.replace(faststart_tmp, chosen)
@@ -243,11 +334,12 @@ def _do_download(job_id, url, format_choice, format_id):
 
         if chosen.endswith(".mp4"):
             try:
-                probe = subprocess.run(
+                probe = _run_job_process(
+                    job,
                     ["ffprobe", "-v", "error", "-select_streams", "v:0",
                      "-show_entries", "stream=width,height:format=duration",
                      "-of", "json", chosen],
-                    capture_output=True, text=True, timeout=10,
+                    capture_output=True,
                 )
                 info = json.loads(probe.stdout)
                 stream = (info.get("streams") or [{}])[0]
@@ -259,7 +351,11 @@ def _do_download(job_id, url, format_choice, format_id):
             except Exception:
                 pass
 
+        if job["_timed_out"].is_set():
+            deadline_timer.cancel()
+            return
         job["status"] = "done"
+        job["stage"] = None
         job["file"] = chosen
         job["file_path"] = os.path.abspath(chosen)
         ext = os.path.splitext(chosen)[1]
@@ -270,9 +366,12 @@ def _do_download(job_id, url, format_choice, format_id):
             job["filename"] = f"{safe_title}{ext}" if safe_title else os.path.basename(chosen)
         else:
             job["filename"] = os.path.basename(chosen)
+        _log_result(job, "done")
+        deadline_timer.cancel()
     except Exception as e:
-        job["status"] = "error"
-        job["error"] = str(e)
+        if not job["_timed_out"].is_set():
+            _finish_error(job, "Download failed")
+        deadline_timer.cancel()
 
 
 @app.route("/")
@@ -339,7 +438,23 @@ def start_download():
         return jsonify({"error": "No URL provided"}), 400
 
     job_id = uuid.uuid4().hex[:10]
-    jobs[job_id] = {"status": "downloading", "url": url, "title": title}
+    now = datetime.now(timezone.utc)
+    deadline = now + timedelta(seconds=JOB_TIMEOUT)
+    jobs[job_id] = {
+        "job_id": job_id,
+        "status": "downloading",
+        "stage": "downloading",
+        "url": url,
+        "title": title,
+        "started_at": now.isoformat(),
+        "deadline_at": deadline.isoformat(),
+        "_started_monotonic": time.monotonic(),
+        "_deadline_monotonic": time.monotonic() + JOB_TIMEOUT,
+        "_timed_out": threading.Event(),
+        "_process_lock": threading.Lock(),
+        "_active_process": None,
+    }
+    logger.info("job_id=%s stage=downloading", job_id)
 
     thread = threading.Thread(target=run_download, args=(job_id, url, format_choice, format_id))
     thread.daemon = True
@@ -355,6 +470,9 @@ def check_status(job_id):
         return jsonify({"error": "Job not found"}), 404
     return jsonify({
         "status": job["status"],
+        "stage": job.get("stage"),
+        "started_at": job.get("started_at"),
+        "deadline_at": job.get("deadline_at"),
         "error": job.get("error"),
         "filename": job.get("filename"),
         "progress": job.get("progress"),

@@ -14,9 +14,12 @@ from reclip_client import (
     ReclipError,
     ReclipInfoError,
     ReclipServiceDown,
+    ReclipJobDeadlineExceeded,
+    ReclipJobLost,
+    ReclipServiceOutage,
     get_info,
-    poll_status,
     start_download,
+    wait_for_job,
 )
 import event_client
 from upload import TelegramUploadError, send_local_path
@@ -47,6 +50,54 @@ SUPPORTED_PLATFORMS = [
     "Bandcamp", "Bilibili", "Pinterest", "Tumblr", "Threads",
     "LinkedIn", "Loom", "Streamable", "and 1000+ more via yt-dlp",
 ]
+
+
+async def _wait_for_download_job(job_id: str, message):
+    """Relay new ReClip progress states without duplicating Telegram edits."""
+    last_status_text = None
+
+    async def on_status(status):
+        nonlocal last_status_text
+        if status.get("status") != "downloading":
+            return
+
+        stage = status.get("stage") or "downloading"
+        progress = status.get("progress")
+        if stage == "postprocessing":
+            text = "Post-processing…"
+        elif progress and isinstance(progress, dict) and progress.get("percent") is not None:
+            text = f"Downloading… {progress['percent']}%"
+        else:
+            text = "Downloading…"
+
+        if text != last_status_text:
+            await _edit_safe(message, text)
+            last_status_text = text
+
+        try:
+            await event_client.send_progress(
+                job_id=job_id,
+                percent=progress.get("percent") if isinstance(progress, dict) else None,
+                speed=progress.get("speed") if isinstance(progress, dict) else None,
+                eta=progress.get("eta") if isinstance(progress, dict) else None,
+                downloaded_bytes=progress.get("downloaded_bytes") if isinstance(progress, dict) else None,
+                total_bytes=progress.get("total_bytes") if isinstance(progress, dict) else None,
+                stage=stage,
+            )
+        except Exception:
+            pass
+
+    return await wait_for_job(job_id, on_status)
+
+
+def _wait_error_message(error: ReclipError) -> str:
+    if isinstance(error, ReclipJobLost):
+        return ReclipJobLost.message
+    if isinstance(error, ReclipServiceOutage):
+        return ReclipServiceOutage.message
+    if isinstance(error, ReclipJobDeadlineExceeded):
+        return ReclipJobDeadlineExceeded.message
+    return "Download service unavailable for more than 60 seconds."
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -240,60 +291,28 @@ async def _direct_download(update: Update, status_msg, url: str, fmt: str, forma
         pass
 
     _direct_download_start = time.time()
-    file_path = None
-    for _ in range(450):
-        await asyncio.sleep(2)
-        try:
-            status = await poll_status(job_id)
-        except ReclipServiceDown:
-            await _edit_safe(status_msg, "Download service unavailable.")
-            _stats["errors"] += 1
-            await event_client.send_download_error(job_id=job_id, error_message="Download service unavailable")
-            return
-        except ReclipError:
-            continue
-
-        st = status.get("status")
-        if st == "done":
-            file_path = status.get("file_path") or status.get("filename")
-            video_meta = {
-                "width": status.get("width"),
-                "height": status.get("height"),
-                "duration": status.get("duration"),
-            }
-            break
-        elif st == "error":
-            await _edit_safe(status_msg, f"Error: {status.get('error', 'Unknown error')}")
-            _stats["errors"] += 1
-            await event_client.send_download_error(job_id=job_id, error_message=status.get("error", "Unknown error"))
-            return
-        else:
-            progress = status.get("progress")
-            if progress and isinstance(progress, dict) and progress.get("percent") is not None:
-                text = f"Downloading... {progress['percent']}%"
-                try:
-                    await event_client.send_progress(
-                        job_id=job_id,
-                        percent=progress.get("percent"),
-                        speed=progress.get("speed"),
-                        eta=progress.get("eta"),
-                        downloaded_bytes=progress.get("downloaded_bytes"),
-                        total_bytes=progress.get("total_bytes"),
-                    )
-                except Exception:
-                    pass
-            else:
-                text = "Downloading..."
-            try:
-                await status_msg.edit_text(text)
-            except Exception:
-                pass
-
-    if not file_path:
-        await _edit_safe(status_msg, "Download timed out.")
+    try:
+        status = await _wait_for_download_job(job_id, status_msg)
+    except ReclipError as error:
+        message = _wait_error_message(error)
+        await _edit_safe(status_msg, message)
         _stats["errors"] += 1
-        await event_client.send_download_error(job_id=job_id, error_message="Download timed out")
+        await event_client.send_download_error(job_id=job_id, error_message=message)
         return
+
+    if status.get("status") == "error":
+        error_message = status.get("error", "Unknown error")
+        await _edit_safe(status_msg, f"Error: {error_message}")
+        _stats["errors"] += 1
+        await event_client.send_download_error(job_id=job_id, error_message=error_message)
+        return
+
+    file_path = status.get("file_path") or status.get("filename")
+    video_meta = {
+        "width": status.get("width"),
+        "height": status.get("height"),
+        "duration": status.get("duration"),
+    }
 
     local_path = Path(DOWNLOADS_PATH) / Path(file_path).name
     if not local_path.exists():
@@ -576,63 +595,28 @@ async def download_and_send(query, entry: dict, format: str, format_id: str | No
     except Exception:
         pass
 
-    file_path = None
-    for _ in range(450):
-        await asyncio.sleep(2)
-        try:
-            status = await poll_status(job_id)
-        except ReclipServiceDown:
-            await _edit_safe(message, "Download service temporarily unavailable.")
-            _stats["errors"] += 1
-            await event_client.send_download_error(job_id=job_id, error_message="Download service temporarily unavailable")
-            return
-        except ReclipError:
-            continue
-
-        st = status.get("status")
-        if st == "done":
-            file_path = status.get("file_path") or status.get("filename")
-            video_meta = {
-                "width": status.get("width"),
-                "height": status.get("height"),
-                "duration": status.get("duration"),
-            }
-            break
-        elif st == "error":
-            await _edit_safe(message, f"Error: {status.get('error', 'Unknown error')}")
-            _stats["errors"] += 1
-            await event_client.send_download_error(job_id=job_id, error_message=status.get("error", "Unknown error"))
-            return
-        else:
-            progress = status.get("progress")
-            if progress and isinstance(progress, dict) and progress.get("percent") is not None:
-                text = f"Downloading... {progress['percent']}%"
-                try:
-                    await event_client.send_progress(
-                        job_id=job_id,
-                        percent=progress.get("percent"),
-                        speed=progress.get("speed"),
-                        eta=progress.get("eta"),
-                        downloaded_bytes=progress.get("downloaded_bytes"),
-                        total_bytes=progress.get("total_bytes"),
-                    )
-                except Exception:
-                    pass
-            else:
-                text = "Downloading..."
-            try:
-                if message.photo:
-                    await message.edit_caption(caption=text)
-                else:
-                    await message.edit_text(text)
-            except Exception:
-                pass
-
-    if not file_path:
-        await _edit_safe(message, "Download timed out.")
+    try:
+        status = await _wait_for_download_job(job_id, message)
+    except ReclipError as error:
+        error_message = _wait_error_message(error)
+        await _edit_safe(message, error_message)
         _stats["errors"] += 1
-        await event_client.send_download_error(job_id=job_id, error_message="Download timed out")
+        await event_client.send_download_error(job_id=job_id, error_message=error_message)
         return
+
+    if status.get("status") == "error":
+        error_message = status.get("error", "Unknown error")
+        await _edit_safe(message, f"Error: {error_message}")
+        _stats["errors"] += 1
+        await event_client.send_download_error(job_id=job_id, error_message=error_message)
+        return
+
+    file_path = status.get("file_path") or status.get("filename")
+    video_meta = {
+        "width": status.get("width"),
+        "height": status.get("height"),
+        "duration": status.get("duration"),
+    }
 
     local_path = Path(DOWNLOADS_PATH) / Path(file_path).name
     if not local_path.exists():

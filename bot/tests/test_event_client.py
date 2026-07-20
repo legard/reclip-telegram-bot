@@ -47,6 +47,7 @@ def test_send_progress_uses_flat_download_progress_payload(monkeypatch):
         eta=30.0,
         downloaded_bytes=10485760,
         total_bytes=25165824,
+        stage="postprocessing",
     ))
 
     assert captured["type"] == "download_progress"
@@ -56,6 +57,7 @@ def test_send_progress_uses_flat_download_progress_payload(monkeypatch):
     assert captured["eta"] == 30.0
     assert captured["downloaded_bytes"] == 10485760
     assert captured["total_bytes"] == 25165824
+    assert captured["stage"] == "postprocessing"
     assert "data" not in captured
 
 
