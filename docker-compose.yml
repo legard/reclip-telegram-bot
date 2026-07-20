@@ -6,7 +6,7 @@ services:
       - HOST=0.0.0.0
       - PORT=8899
       - MAX_CONCURRENT_DOWNLOADS=${MAX_CONCURRENT_DOWNLOADS:-3}
-      - JOB_TIMEOUT=${JOB_TIMEOUT:-9000}
+      - JOB_TIMEOUT=${JOB_TIMEOUT:-${DOWNLOAD_TIMEOUT:-9000}}
       - DOWNLOADS_PATH=/downloads
     volumes:
       - downloads:/downloads
@@ -22,7 +22,7 @@ services:
       - RECLIP_URL=http://reclip:8899
       - TELEGRAM_BOT_API_URL=http://telegram-bot-api:8081
       - DOWNLOADS_PATH=/downloads
-      - JOB_TIMEOUT=${JOB_TIMEOUT:-9000}
+      - JOB_TIMEOUT=${JOB_TIMEOUT:-${DOWNLOAD_TIMEOUT:-9000}}
       - CLEANUP_MAX_AGE_HOURS=${CLEANUP_MAX_AGE_HOURS:-1}
       - CLEANUP_MAX_DISK_MB=${CLEANUP_MAX_DISK_MB:-5000}
       - CLEANUP_INTERVAL_SECONDS=${CLEANUP_INTERVAL_SECONDS:-300}

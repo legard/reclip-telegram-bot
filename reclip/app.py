@@ -183,11 +183,9 @@ def _terminate_process_group(process):
         os.killpg(process.pid, signal.SIGTERM)
     except (ProcessLookupError, OSError):
         return
-    try:
-        process.wait(timeout=5)
-        return
-    except subprocess.TimeoutExpired:
-        pass
+    # The group leader can exit before an ffmpeg/yt-dlp child. Waiting on the
+    # leader alone would then skip SIGKILL and leave that child running.
+    time.sleep(5)
     try:
         os.killpg(process.pid, signal.SIGKILL)
     except (ProcessLookupError, OSError):

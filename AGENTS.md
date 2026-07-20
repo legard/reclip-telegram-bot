@@ -83,7 +83,7 @@ The bot sends fire-and-forget HTTP POSTs to `DASHBOARD_URL/api/events` with `typ
 
 ### Concurrency & Limits
 - Reclip uses `threading.Semaphore(MAX_CONCURRENT_DOWNLOADS)` (default 3)
-- Each download has a hard timeout of `DOWNLOAD_TIMEOUT` seconds (default 900)
+- ReClip owns one hard `JOB_TIMEOUT` deadline (default 9000 seconds / 150 minutes) across yt-dlp, ffmpeg, faststart, and ffprobe. `DOWNLOAD_TIMEOUT` is a legacy fallback only when `JOB_TIMEOUT` is absent.
 - Bot has a 10-minute in-memory session TTL (`STATE_TTL = 600`)
 
 ### Cleanup (`bot/cleanup.py`)

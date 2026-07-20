@@ -15,6 +15,7 @@ from reclip_client import (
     ReclipError,
     ReclipJobLost,
     ReclipServiceOutage,
+    ReclipJobDeadlineExceeded,
     wait_for_job,
 )
 
@@ -204,6 +205,73 @@ class TestPollStatus:
 
 class TestWaitForJob:
     @pytest.mark.asyncio
+    async def test_caps_poll_request_timeout_at_deadline_grace(self, monkeypatch):
+        captured_timeouts = []
+
+        async def unavailable(job_id, *, timeout):
+            captured_timeouts.append(timeout)
+            raise ReclipServiceDown("offline")
+
+        clock = iter([1000.0, 1060.0])
+        monkeypatch.setattr("reclip_client.poll_status", unavailable)
+
+        with pytest.raises(ReclipServiceOutage):
+            await wait_for_job(
+                "job-1",
+                sleep=AsyncMock(),
+                monotonic=lambda: next(clock),
+                wall_clock=lambda: 100.0,
+                initial_deadline=45.0,
+            )
+
+        assert captured_timeouts == [5.0]
+
+    @pytest.mark.asyncio
+    async def test_counts_a_slow_failed_request_from_its_start(self, monkeypatch):
+        poll_started = []
+        monotonic_values = iter([0.0, 61.0])
+
+        async def unavailable(job_id, *, timeout):
+            poll_started.append(timeout)
+            raise ReclipServiceDown("offline")
+
+        monkeypatch.setattr("reclip_client.poll_status", unavailable)
+
+        with pytest.raises(ReclipServiceOutage, match="more than 60 seconds"):
+            await wait_for_job(
+                "job-1",
+                sleep=AsyncMock(),
+                monotonic=lambda: next(monotonic_values),
+                wall_clock=lambda: 100.0,
+                initial_deadline=10_000.0,
+            )
+
+        assert poll_started == [10.0]
+
+    @pytest.mark.asyncio
+    async def test_does_not_sleep_past_deadline_grace(self, monkeypatch):
+        sleeps = []
+
+        async def downloading(job_id, *, timeout):
+            return {"status": "downloading"}
+
+        async def record_sleep(seconds):
+            sleeps.append(seconds)
+
+        wall_clock_values = iter([100.0, 104.0, 105.0])
+        monkeypatch.setattr("reclip_client.poll_status", downloading)
+
+        with pytest.raises(ReclipJobDeadlineExceeded):
+            await wait_for_job(
+                "job-1",
+                sleep=record_sleep,
+                wall_clock=lambda: next(wall_clock_values),
+                initial_deadline=45.0,
+            )
+
+        assert sleeps == [1.0]
+
+    @pytest.mark.asyncio
     async def test_waits_past_450_downloading_responses_until_done(self, monkeypatch):
         responses = [
             {
@@ -215,7 +283,7 @@ class TestWaitForJob:
         ]
         responses.append({"status": "done", "file_path": "/downloads/video.mp4"})
 
-        async def fake_poll_status(job_id):
+        async def fake_poll_status(job_id, *, timeout):
             return responses.pop(0)
 
         async def no_sleep(seconds):
@@ -233,7 +301,7 @@ class TestWaitForJob:
         clock = iter([0, 60])
         calls = 0
 
-        async def unavailable(job_id):
+        async def unavailable(job_id, *, timeout):
             nonlocal calls
             calls += 1
             raise ReclipServiceDown("offline")

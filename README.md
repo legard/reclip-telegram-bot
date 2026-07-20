@@ -100,7 +100,7 @@ All configuration is via environment variables in `.env`:
 | `TELEGRAM_API_ID` | (required) | Telegram API ID from my.telegram.org |
 | `TELEGRAM_API_HASH` | (required) | Telegram API hash from my.telegram.org |
 | `MAX_CONCURRENT_DOWNLOADS` | 3 | Max parallel downloads |
-| `JOB_TIMEOUT` | 9000 | Shared ReClip deadline in seconds (150 minutes) |
+| `JOB_TIMEOUT` | 9000 | Shared ReClip deadline in seconds (150 minutes), covering download and post-processing |
 | `CLEANUP_MAX_AGE_HOURS` | 1 | Delete files older than this |
 | `CLEANUP_MAX_DISK_MB` | 5000 | Max disk usage before cleanup; `0` disables size cleanup while age cleanup remains active |
 | `CLEANUP_INTERVAL_SECONDS` | 300 | Cleanup check interval |
@@ -108,6 +108,10 @@ All configuration is via environment variables in `.env`:
 | `DASHBOARD_PASSWORD` | (required) | Dashboard login password |
 | `DASHBOARD_PORT` | 8080 | Dashboard port on host |
 | `DASHBOARD_SECRET_KEY` | change-me | Cookie signing key |
+
+`JOB_TIMEOUT` is the shared ReClip deadline for both services. Existing
+deployments that have only `DOWNLOAD_TIMEOUT` continue to use that value;
+otherwise the default is 9000 seconds.
 
 ## Admin Dashboard
 

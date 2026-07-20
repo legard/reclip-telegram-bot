@@ -174,4 +174,4 @@ def test_compose_passes_the_shared_job_deadline_to_reclip_and_bot():
 
     for service in ("reclip", "bot"):
         environment = compose["services"][service]["environment"]
-        assert "JOB_TIMEOUT=${JOB_TIMEOUT:-9000}" in environment
+        assert "JOB_TIMEOUT=${JOB_TIMEOUT:-${DOWNLOAD_TIMEOUT:-9000}}" in environment

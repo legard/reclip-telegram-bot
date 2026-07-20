@@ -130,6 +130,7 @@ def test_expired_job_terminates_process_group_and_removes_all_job_files(monkeypa
     signals = []
     monkeypatch.setattr(app, "DOWNLOAD_DIR", str(tmp_path))
     monkeypatch.setattr(app.os, "killpg", lambda pid, sig: signals.append((pid, sig)))
+    monkeypatch.setattr(app.time, "sleep", lambda seconds: None)
     for name in ("job-1.mp4", "job-1.part", "other-job.mp4"):
         (tmp_path / name).write_text("data")
     job = {
@@ -153,6 +154,25 @@ def test_expired_job_terminates_process_group_and_removes_all_job_files(monkeypa
     assert not (tmp_path / "job-1.mp4").exists()
     assert not (tmp_path / "job-1.part").exists()
     assert (tmp_path / "other-job.mp4").exists()
+
+
+def test_process_group_is_killed_after_grace_when_leader_exits(monkeypatch):
+    """The process leader exiting does not prove its descendants exited."""
+    class Process:
+        pid = 4242
+
+    signals = []
+    sleeps = []
+    monkeypatch.setattr(app.os, "killpg", lambda pid, sig: signals.append((pid, sig)))
+    monkeypatch.setattr(app.time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    app._terminate_process_group(Process())
+
+    assert sleeps == [5]
+    assert signals == [
+        (4242, app.signal.SIGTERM),
+        (4242, app.signal.SIGKILL),
+    ]
 
 
 def test_job_processes_start_in_a_separate_process_group(monkeypatch):
@@ -209,6 +229,7 @@ def test_expiry_waits_for_process_registration_before_cleanup(monkeypatch, tmp_p
     monkeypatch.setattr(app, "DOWNLOAD_DIR", str(tmp_path))
     monkeypatch.setattr(app.subprocess, "Popen", fake_popen)
     monkeypatch.setattr(app.os, "killpg", fake_killpg)
+    monkeypatch.setattr(app.time, "sleep", lambda seconds: None)
     (tmp_path / "job-1.part").write_text("partial output")
 
     starter = app.threading.Thread(
@@ -231,7 +252,10 @@ def test_expiry_waits_for_process_registration_before_cleanup(monkeypatch, tmp_p
 
     assert process_started.is_set()
     assert expiry_finished.is_set()
-    assert signals == [(4242, app.signal.SIGTERM)]
+    assert signals == [
+        (4242, app.signal.SIGTERM),
+        (4242, app.signal.SIGKILL),
+    ]
     assert not (tmp_path / "job-1.part").exists()
     assert not (tmp_path / "job-1.late").exists()
 

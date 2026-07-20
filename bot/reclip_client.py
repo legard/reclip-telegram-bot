@@ -90,10 +90,10 @@ async def start_download(url: str, format: str, format_id: str | None, title: st
         raise ReclipDownloadError(f"Download request failed: {e}")
 
 
-async def poll_status(job_id: str) -> dict:
+async def poll_status(job_id: str, *, timeout: float = 10.0) -> dict:
     try:
         async with _client() as client:
-            resp = await client.get(f"/api/status/{job_id}", timeout=10.0)
+            resp = await client.get(f"/api/status/{job_id}", timeout=timeout)
             resp.raise_for_status()
             return resp.json()
     except httpx.ConnectError:
@@ -118,24 +118,51 @@ def _deadline_timestamp(value: str | None) -> float | None:
 
 
 async def wait_for_job(
-    job_id: str, on_status=None, *, sleep=asyncio.sleep, monotonic=time.monotonic
+    job_id: str,
+    on_status=None,
+    *,
+    sleep=asyncio.sleep,
+    monotonic=time.monotonic,
+    wall_clock=time.time,
+    initial_deadline: float | None = None,
 ) -> dict:
     """Wait for a terminal ReClip status while enforcing service-side deadline bounds."""
-    deadline = time.time() + JOB_TIMEOUT
+    deadline = initial_deadline if initial_deadline is not None else wall_clock() + JOB_TIMEOUT
     outage_started_at = None
 
-    while time.time() <= deadline + JOB_DEADLINE_GRACE_SECONDS:
+    while True:
+        remaining_deadline = deadline + JOB_DEADLINE_GRACE_SECONDS - wall_clock()
+        if remaining_deadline <= 0:
+            raise ReclipJobDeadlineExceeded(ReclipJobDeadlineExceeded.message)
+
+        request_timeout = min(10.0, remaining_deadline)
+        if outage_started_at is not None:
+            outage_remaining = SERVICE_OUTAGE_LIMIT_SECONDS - (monotonic() - outage_started_at)
+            if outage_remaining <= 0:
+                raise ReclipServiceOutage(ReclipServiceOutage.message)
+            request_timeout = min(request_timeout, outage_remaining)
+
+        request_started_at = monotonic()
         try:
-            status = await poll_status(job_id)
+            status = await poll_status(job_id, timeout=request_timeout)
         except ReclipJobLost:
             raise
         except ReclipError:
             now = monotonic()
             if outage_started_at is None:
-                outage_started_at = now
+                # A slow request is part of the outage, so count it from the
+                # instant the request began rather than when it raised.
+                outage_started_at = request_started_at
             if now - outage_started_at >= SERVICE_OUTAGE_LIMIT_SECONDS:
                 raise ReclipServiceOutage(ReclipServiceOutage.message)
-            await sleep(POLL_INTERVAL_SECONDS)
+            remaining_deadline = deadline + JOB_DEADLINE_GRACE_SECONDS - wall_clock()
+            outage_remaining = SERVICE_OUTAGE_LIMIT_SECONDS - (now - outage_started_at)
+            sleep_for = min(POLL_INTERVAL_SECONDS, remaining_deadline, outage_remaining)
+            if sleep_for <= 0:
+                if outage_remaining <= 0:
+                    raise ReclipServiceOutage(ReclipServiceOutage.message)
+                raise ReclipJobDeadlineExceeded(ReclipJobDeadlineExceeded.message)
+            await sleep(sleep_for)
             continue
 
         outage_started_at = None
@@ -151,6 +178,7 @@ async def wait_for_job(
         if status.get("status") in ("done", "error"):
             return status
 
-        await sleep(POLL_INTERVAL_SECONDS)
-
-    raise ReclipJobDeadlineExceeded(ReclipJobDeadlineExceeded.message)
+        remaining_deadline = deadline + JOB_DEADLINE_GRACE_SECONDS - wall_clock()
+        if remaining_deadline <= 0:
+            raise ReclipJobDeadlineExceeded(ReclipJobDeadlineExceeded.message)
+        await sleep(min(POLL_INTERVAL_SECONDS, remaining_deadline))
