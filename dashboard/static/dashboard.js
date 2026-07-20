@@ -317,13 +317,20 @@ async function fetchActiveDownloads() {
           <td>${escapeHtml(dl.username || dl.user_id || '—')}</td>
           <td class="url-cell">${escapeHtml((dl.url || '').slice(0, 50))}${(dl.url || '').length > 50 ? '…' : ''}</td>
           <td>${dl.platform ? `<span class="badge badge-platform">${escapeHtml(dl.platform)}</span>` : '—'}</td>
-          <td class="mono">${dl.progress != null ? dl.progress.toFixed(0) + '%' : '—'}</td>
+          <td>${escapeHtml(formatDownloadStage(dl.stage))}</td>
+          <td class="mono">${dl.percent != null ? dl.percent.toFixed(0) + '%' : '—'}</td>
         </tr>
       `).join('');
     }
   } catch (e) {
     console.warn('fetchActiveDownloads error', e);
   }
+}
+
+function formatDownloadStage(stage) {
+  if (stage === 'downloading') return 'Downloading';
+  if (stage === 'postprocessing') return 'Post-processing';
+  return stage || '—';
 }
 
 function escapeHtml(str) {

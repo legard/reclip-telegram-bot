@@ -61,6 +61,7 @@ async def ingest_event(request: Request) -> Dict[str, str]:
             "url": data.get("url"),
             "platform": data.get("platform"),
             "title": data.get("title"),
+            "stage": data.get("stage"),
             "percent": 0,
             "speed": 0,
             "eta": 0,
@@ -70,6 +71,7 @@ async def ingest_event(request: Request) -> Dict[str, str]:
         job_id = data.get("job_id")
         if job_id and job_id in _active_downloads:
             _active_downloads[job_id].update({
+                "stage": data.get("stage", _active_downloads[job_id].get("stage")),
                 "percent": data.get("percent", 0),
                 "speed": data.get("speed", 0),
                 "eta": data.get("eta", 0),

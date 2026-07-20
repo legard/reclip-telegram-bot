@@ -208,6 +208,46 @@ def test_active_downloads_with_auth():
     assert "job-active-1" in job_ids
 
 
+def test_active_download_exposes_current_stage_and_percent():
+    """The active-download API retains the stage from lifecycle events."""
+    job_id = "job-active-stage-1"
+    client.post("/api/events", json={
+        "type": "download_start",
+        "job_id": job_id,
+        "user_id": 11,
+        "username": "frank",
+        "chat_id": 11,
+        "url": "https://example.com/staged.mp4",
+        "platform": "youtube",
+        "stage": "downloading",
+    })
+    client.post("/api/events", json={
+        "type": "download_progress",
+        "job_id": job_id,
+        "stage": "postprocessing",
+        "percent": 83.5,
+    })
+
+    response = client.get("/api/active-downloads", cookies=_login())
+    assert response.status_code == 200
+    active_job = next(item for item in response.json() if item["job_id"] == job_id)
+    assert active_job["stage"] == "postprocessing"
+    assert active_job["percent"] == 83.5
+
+
+def test_active_downloads_ui_shows_stage_and_percent_progress():
+    """The table renders a stage column and reads the API percent field."""
+    from pathlib import Path
+
+    dashboard_dir = Path(__file__).resolve().parents[1]
+    template = (dashboard_dir / "templates" / "dashboard.html").read_text()
+    javascript = (dashboard_dir / "static" / "dashboard.js").read_text()
+
+    assert "<th>Stage</th>" in template
+    assert "dl.percent != null" in javascript
+    assert "dl.progress" not in javascript
+
+
 # ---------------------------------------------------------------------------
 # Task 5: Delete files
 # ---------------------------------------------------------------------------
