@@ -1,3 +1,6 @@
+import asyncio
+import time
+
 import pytest
 import httpx
 from unittest.mock import AsyncMock, patch
@@ -204,6 +207,67 @@ class TestPollStatus:
 
 
 class TestWaitForJob:
+    @pytest.mark.asyncio
+    async def test_outer_deadline_cancels_a_poll_that_exceeds_its_request_budget(self, monkeypatch):
+        poll_timeouts = []
+        poll_was_cancelled = False
+
+        async def slow_poll(job_id, *, timeout):
+            nonlocal poll_was_cancelled
+            poll_timeouts.append(timeout)
+            try:
+                await asyncio.sleep(max(timeout * 5, 0.1))
+            except asyncio.CancelledError:
+                poll_was_cancelled = True
+                raise
+            return {"status": "downloading"}
+
+        monkeypatch.setattr("reclip_client.poll_status", slow_poll)
+
+        # The deadline grace expires shortly after this call begins.  A scalar
+        # httpx timeout alone cannot cancel a coroutine that ignores it.
+        initial_deadline = time.time() - 60 + 0.05
+        with pytest.raises(ReclipJobDeadlineExceeded):
+            await wait_for_job("job-1", initial_deadline=initial_deadline)
+
+        assert poll_timeouts and poll_timeouts[0] < 0.1
+        assert poll_was_cancelled
+
+    @pytest.mark.asyncio
+    async def test_outer_poll_timeout_uses_outage_error_after_an_outage_starts(self, monkeypatch):
+        calls = 0
+        poll_was_cancelled = False
+
+        async def intermittently_unavailable(job_id, *, timeout):
+            nonlocal calls, poll_was_cancelled
+            calls += 1
+            if calls == 1:
+                raise ReclipServiceDown("offline")
+            if calls == 2:
+                try:
+                    await asyncio.sleep(max(timeout * 5, 0.1))
+                except asyncio.CancelledError:
+                    poll_was_cancelled = True
+                    raise
+                return {"status": "downloading"}
+            return {"status": "done"}
+
+        async def no_sleep(seconds):
+            pass
+
+        monkeypatch.setattr("reclip_client.SERVICE_OUTAGE_LIMIT_SECONDS", 0.05)
+        monkeypatch.setattr("reclip_client.poll_status", intermittently_unavailable)
+
+        with pytest.raises(ReclipServiceOutage):
+            await wait_for_job(
+                "job-1",
+                sleep=no_sleep,
+                initial_deadline=time.time() + 60,
+            )
+
+        assert calls == 2
+        assert poll_was_cancelled
+
     @pytest.mark.asyncio
     async def test_caps_poll_request_timeout_at_deadline_grace(self, monkeypatch):
         captured_timeouts = []

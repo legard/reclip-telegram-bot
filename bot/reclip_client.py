@@ -144,10 +144,14 @@ async def wait_for_job(
 
         request_started_at = monotonic()
         try:
-            status = await poll_status(job_id, timeout=request_timeout)
+            # httpx's scalar timeout is applied to individual I/O operations.
+            # Keep a separate total elapsed bound so a stalled transport cannot
+            # keep this job alive beyond the service deadline or outage budget.
+            async with asyncio.timeout(request_timeout):
+                status = await poll_status(job_id, timeout=request_timeout)
         except ReclipJobLost:
             raise
-        except ReclipError:
+        except (ReclipError, TimeoutError):
             now = monotonic()
             if outage_started_at is None:
                 # A slow request is part of the outage, so count it from the
