@@ -167,3 +167,11 @@ def test_release_has_source_and_revision_labels():
     labels = _build_step(workflow)["with"]["labels"]
     assert "org.opencontainers.image.source=https://github.com/${{ github.repository }}" in labels
     assert "org.opencontainers.image.revision=${{ github.sha }}" in labels
+
+
+def test_compose_passes_the_shared_job_deadline_to_reclip_and_bot():
+    compose = load_yaml(COMPOSE_PATH)
+
+    for service in ("reclip", "bot"):
+        environment = compose["services"][service]["environment"]
+        assert "JOB_TIMEOUT=${JOB_TIMEOUT:-9000}" in environment
