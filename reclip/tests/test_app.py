@@ -173,6 +173,104 @@ def test_job_processes_start_in_a_separate_process_group(monkeypatch):
     assert captured["start_new_session"] is True
 
 
+def test_expiry_waits_for_process_registration_before_cleanup(monkeypatch, tmp_path):
+    """A process started as the deadline fires cannot write after cleanup."""
+    class Process:
+        pid = 4242
+
+        def wait(self, timeout):
+            return 0
+
+    job = {
+        "job_id": "job-1",
+        "status": "downloading",
+        "stage": "downloading",
+        "_timed_out": app.threading.Event(),
+        "_process_lock": app.threading.Lock(),
+        "_active_process": None,
+    }
+    popen_entered = app.threading.Event()
+    allow_popen_to_return = app.threading.Event()
+    expiry_finished = app.threading.Event()
+    process_started = app.threading.Event()
+    signals = []
+
+    def fake_popen(*args, **kwargs):
+        popen_entered.set()
+        assert allow_popen_to_return.wait(timeout=1)
+        process_started.set()
+        return Process()
+
+    def fake_killpg(pid, sig):
+        signals.append((pid, sig))
+        if sig == app.signal.SIGTERM:
+            (tmp_path / "job-1.late").write_text("late output")
+
+    monkeypatch.setattr(app, "DOWNLOAD_DIR", str(tmp_path))
+    monkeypatch.setattr(app.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(app.os, "killpg", fake_killpg)
+    (tmp_path / "job-1.part").write_text("partial output")
+
+    starter = app.threading.Thread(
+        target=app._start_job_process, args=(job, ["yt-dlp", "url"]),
+    )
+    starter.start()
+    assert popen_entered.wait(timeout=1)
+
+    def expire():
+        app.expire_job(job)
+        expiry_finished.set()
+
+    expiry = app.threading.Thread(target=expire)
+    expiry.start()
+    assert not expiry_finished.wait(timeout=0.1)
+
+    allow_popen_to_return.set()
+    starter.join(timeout=1)
+    expiry.join(timeout=1)
+
+    assert process_started.is_set()
+    assert expiry_finished.is_set()
+    assert signals == [(4242, app.signal.SIGTERM)]
+    assert not (tmp_path / "job-1.part").exists()
+    assert not (tmp_path / "job-1.late").exists()
+
+
+def test_expired_job_error_is_not_overwritten_by_completion():
+    job = {
+        "job_id": "job-1",
+        "status": "error",
+        "stage": None,
+        "error": "Job timed out after 150 minutes during downloading.",
+        "_timed_out": app.threading.Event(),
+        "_process_lock": app.threading.Lock(),
+        "_active_process": None,
+    }
+
+    assert hasattr(app, "_finish_done")
+    assert app._finish_done(job) is False
+
+    assert job["status"] == "error"
+    assert job["error"] == "Job timed out after 150 minutes during downloading."
+    assert "file" not in job
+
+
+def test_timeout_message_uses_configured_job_deadline(monkeypatch):
+    monkeypatch.setattr(app, "JOB_TIMEOUT", 90)
+    job = {
+        "job_id": "job-1",
+        "status": "downloading",
+        "stage": "downloading",
+        "_timed_out": app.threading.Event(),
+        "_process_lock": app.threading.Lock(),
+        "_active_process": None,
+    }
+
+    app.expire_job(job)
+
+    assert job["error"] == "Job timed out after 1.5 minutes during downloading."
+
+
 def test_download_slot_is_released_after_job_finishes(monkeypatch):
     class Semaphore:
         def __init__(self):

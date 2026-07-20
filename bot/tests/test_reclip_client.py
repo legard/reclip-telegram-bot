@@ -188,6 +188,19 @@ class TestPollStatus:
             with pytest.raises(ReclipJobLost, match="service restarted"):
                 await poll_status("abc1234567")
 
+    @pytest.mark.asyncio
+    async def test_server_error_raises_status_error(self, mock_response):
+        resp = mock_response(503)
+        with patch("reclip_client._client") as mock_client:
+            client = AsyncMock()
+            client.__aenter__ = AsyncMock(return_value=client)
+            client.__aexit__ = AsyncMock(return_value=False)
+            client.get = AsyncMock(return_value=resp)
+            mock_client.return_value = client
+
+            with pytest.raises(ReclipError, match="Status request failed: 503"):
+                await poll_status("abc1234567")
+
 
 class TestWaitForJob:
     @pytest.mark.asyncio
@@ -217,15 +230,38 @@ class TestWaitForJob:
 
     @pytest.mark.asyncio
     async def test_reports_service_outage_after_sixty_seconds(self, monkeypatch):
-        clock = iter([0, 61])
+        clock = iter([0, 60])
+        calls = 0
 
         async def unavailable(job_id):
+            nonlocal calls
+            calls += 1
             raise ReclipServiceDown("offline")
 
         async def no_sleep(seconds):
-            pass
+            if calls >= 2:
+                pytest.fail("wait_for_job did not stop at the 60-second outage limit")
 
         monkeypatch.setattr("reclip_client.poll_status", unavailable)
 
         with pytest.raises(ReclipServiceOutage, match="more than 60 seconds"):
             await wait_for_job("job-1", sleep=no_sleep, monotonic=lambda: next(clock))
+
+    @pytest.mark.asyncio
+    async def test_retries_server_error_and_returns_terminal_status(self, mock_response):
+        unavailable = mock_response(503)
+        done = mock_response(200, {"status": "done", "file_path": "/downloads/video.mp4"})
+        with patch("reclip_client._client") as mock_client:
+            client = AsyncMock()
+            client.__aenter__ = AsyncMock(return_value=client)
+            client.__aexit__ = AsyncMock(return_value=False)
+            client.get = AsyncMock(side_effect=[unavailable, done])
+            mock_client.return_value = client
+
+            async def no_sleep(seconds):
+                assert seconds == 2
+
+            result = await wait_for_job("job-1", sleep=no_sleep)
+
+        assert result["status"] == "done"
+        assert client.get.await_count == 2

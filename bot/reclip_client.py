@@ -125,7 +125,6 @@ async def wait_for_job(
     outage_started_at = None
 
     while time.time() <= deadline + JOB_DEADLINE_GRACE_SECONDS:
-        await sleep(POLL_INTERVAL_SECONDS)
         try:
             status = await poll_status(job_id)
         except ReclipJobLost:
@@ -134,8 +133,9 @@ async def wait_for_job(
             now = monotonic()
             if outage_started_at is None:
                 outage_started_at = now
-            if now - outage_started_at > SERVICE_OUTAGE_LIMIT_SECONDS:
+            if now - outage_started_at >= SERVICE_OUTAGE_LIMIT_SECONDS:
                 raise ReclipServiceOutage(ReclipServiceOutage.message)
+            await sleep(POLL_INTERVAL_SECONDS)
             continue
 
         outage_started_at = None
@@ -150,5 +150,7 @@ async def wait_for_job(
 
         if status.get("status") in ("done", "error"):
             return status
+
+        await sleep(POLL_INTERVAL_SECONDS)
 
     raise ReclipJobDeadlineExceeded(ReclipJobDeadlineExceeded.message)

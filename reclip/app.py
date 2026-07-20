@@ -125,8 +125,12 @@ def _job_duration(job):
 
 
 def _log_stage(job, stage):
-    job["stage"] = stage
+    with job["_process_lock"]:
+        if job.get("status") != "downloading" or job["_timed_out"].is_set():
+            return False
+        job["stage"] = stage
     logger.info("job_id=%s stage=%s", job["job_id"], stage)
+    return True
 
 
 def _log_result(job, result):
@@ -144,13 +148,34 @@ def _cleanup_job_files(job_id):
             pass
 
 
+def _timeout_minutes():
+    minutes = JOB_TIMEOUT / 60
+    return str(int(minutes)) if minutes.is_integer() else f"{minutes:g}"
+
+
 def _finish_error(job, message):
-    if job.get("status") == "done":
-        return
-    job["status"] = "error"
-    job["stage"] = None
-    job["error"] = message
+    with job["_process_lock"]:
+        if job.get("status") in ("done", "error"):
+            return False
+        job["status"] = "error"
+        job["stage"] = None
+        job["error"] = message
     _log_result(job, "error")
+    return True
+
+
+def _finish_done(job, *, file=None, file_path=None, filename=None):
+    """Atomically finalize a job unless an earlier terminal state won the race."""
+    with job["_process_lock"]:
+        if job.get("status") != "downloading" or job["_timed_out"].is_set():
+            return False
+        job["status"] = "done"
+        job["stage"] = None
+        if file is not None:
+            job["file"] = file
+            job["file_path"] = file_path
+            job["filename"] = filename
+        return True
 
 
 def _terminate_process_group(process):
@@ -171,26 +196,30 @@ def _terminate_process_group(process):
 
 def expire_job(job):
     """Stop the active process group and remove partial output at the job deadline."""
-    if job.get("status") in ("done", "error"):
-        return
-    job["_timed_out"].set()
-    stage = job.get("stage") or "downloading"
-    logger.info("job_id=%s deadline_exceeded stage=%s", job["job_id"], stage)
     with job["_process_lock"]:
+        if job.get("status") in ("done", "error"):
+            return
+        job["_timed_out"].set()
+        stage = job.get("stage") or "downloading"
+        job["status"] = "error"
+        job["stage"] = None
+        job["error"] = (
+            f"Job timed out after {_timeout_minutes()} minutes during {stage}."
+        )
         process = job.get("_active_process")
+    logger.info("job_id=%s deadline_exceeded stage=%s", job["job_id"], stage)
+    _log_result(job, "error")
     if process is not None:
         _terminate_process_group(process)
     _cleanup_job_files(job["job_id"])
-    _finish_error(job, f"Job timed out after 150 minutes during {stage}.")
 
 
 def _start_job_process(job, command, **kwargs):
-    process = subprocess.Popen(command, start_new_session=True, **kwargs)
     with job["_process_lock"]:
+        if job.get("status") in ("done", "error") or job["_timed_out"].is_set():
+            return None
+        process = subprocess.Popen(command, start_new_session=True, **kwargs)
         job["_active_process"] = process
-        timed_out = job["_timed_out"].is_set()
-    if timed_out:
-        _terminate_process_group(process)
     return process
 
 
@@ -207,6 +236,8 @@ def _run_job_process(job, command, *, capture_output=False):
         "text": True,
     }
     process = _start_job_process(job, command, **kwargs)
+    if process is None:
+        return SimpleNamespace(returncode=-1, stdout="", stderr="")
     try:
         stdout, stderr = process.communicate()
         return SimpleNamespace(returncode=process.returncode, stdout=stdout, stderr=stderr)
@@ -218,8 +249,7 @@ def run_download(job_id, url, format_choice, format_id):
     job = jobs[job_id]
 
     if not download_semaphore.acquire(timeout=30):
-        job["status"] = "error"
-        job["error"] = "Too many concurrent downloads, please try again later"
+        _finish_error(job, "Too many concurrent downloads, please try again later")
         return
 
     try:
@@ -242,6 +272,9 @@ def _do_download(job_id, url, format_choice, format_id):
         process = _start_job_process(
             job, cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
         )
+        if process is None:
+            deadline_timer.cancel()
+            return
         try:
             for line in process.stderr:
                 record_download_output(job, stderr_lines, line.rstrip("\n"))
@@ -351,22 +384,22 @@ def _do_download(job_id, url, format_choice, format_id):
             except Exception:
                 pass
 
-        if job["_timed_out"].is_set():
-            deadline_timer.cancel()
-            return
-        job["status"] = "done"
-        job["stage"] = None
-        job["file"] = chosen
-        job["file_path"] = os.path.abspath(chosen)
         ext = os.path.splitext(chosen)[1]
         title = job.get("title", "").strip()
         # Sanitize title for filename
         if title:
             safe_title = "".join(c for c in title if c not in r'\/:*?"<>|').strip()[:20].strip()
-            job["filename"] = f"{safe_title}{ext}" if safe_title else os.path.basename(chosen)
+            filename = f"{safe_title}{ext}" if safe_title else os.path.basename(chosen)
         else:
-            job["filename"] = os.path.basename(chosen)
-        _log_result(job, "done")
+            filename = os.path.basename(chosen)
+        completed = _finish_done(
+            job,
+            file=chosen,
+            file_path=os.path.abspath(chosen),
+            filename=filename,
+        )
+        if completed:
+            _log_result(job, "done")
         deadline_timer.cancel()
     except Exception as e:
         if not job["_timed_out"].is_set():
