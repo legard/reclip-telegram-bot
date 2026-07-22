@@ -78,7 +78,7 @@ async def test_cleanup_error_does_not_resend_delivered_file(tmp_path, monkeypatc
     chat = AsyncMock()
 
     def fail_unlink(_self):
-        raise OSError("temporary S3 delete failure")
+        raise OSError("temporary local file delete failure")
 
     monkeypatch.setattr(Path, "unlink", fail_unlink)
     size = await send_local_path(

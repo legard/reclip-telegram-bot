@@ -153,10 +153,10 @@ def test_release_runs_reclip_tests_and_installs_requirements():
     assert "python -m pytest reclip/tests -v" in commands
 
 
-def test_release_is_amd64_and_immutable():
+def test_release_is_multi_arch_and_immutable():
     workflow = load_yaml(WORKFLOW_PATH)
     values = _build_step(workflow)["with"]
-    assert values["platforms"] == "linux/amd64"
+    assert values["platforms"] == "linux/amd64,linux/arm64"
     assert ":${{ steps.version.outputs.version }}" in values["tags"]
     assert ":sha-${{ github.sha }}" in values["tags"]
     assert ":latest" not in values["tags"]
