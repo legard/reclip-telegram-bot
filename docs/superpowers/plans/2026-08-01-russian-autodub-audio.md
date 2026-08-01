@@ -507,6 +507,8 @@ git commit -m "Обнаруживать русскую дорожку в ReClip 
 **Files:**
 - Modify: `reclip/app.py:45-67,246-405,460-494`
 - Modify: `reclip/tests/test_app.py`
+- Modify: `docker-compose.yml:1-20`
+- Modify: `.github/tests/test_ci_config.py`
 
 **Interfaces:**
 - Consumes: `is_youtube_url`, `build_russian_extractor_args`, `russian_download_available`, and `build_russian_format_selector` from Task 2.
@@ -659,10 +661,14 @@ Run: `python -m pytest reclip/tests -v`
 
 Expected: all ReClip tests pass, especially the pre-existing deadline, process-group, cleanup, semaphore, codec, and compose contracts.
 
+Run: `python -m pytest .github/tests/test_ci_config.py -k bgutil -v && docker compose config >/dev/null`
+
+Expected: source Compose renders an internal-only `bgutil` service with exact image `brainicism/bgutil-ytdlp-pot-provider:1.3.1`; ReClip depends on it and receives `POT_PROVIDER_URL=http://bgutil:4416`.
+
 - [ ] **Step 8: Commit download execution**
 
 ```bash
-git add reclip/app.py reclip/tests/test_app.py
+git add reclip/app.py reclip/tests/test_app.py docker-compose.yml .github/tests/test_ci_config.py
 git commit -m "Скачивать MP4 с русской дорожкой"
 ```
 
@@ -960,7 +966,6 @@ git commit -m "Добавить выбор русской дорожки в Tele
 **Files:**
 - Modify: `.github/workflows/release.yml:25-40`
 - Modify: `.github/tests/test_ci_config.py:147-177`
-- Modify: `docker-compose.yml:1-20`
 - Modify: `AGENTS.md:7-16,27-43`
 - Modify: `README.md:10-15,145-153,153-166`
 
@@ -977,23 +982,13 @@ def test_release_builds_and_executes_reclip_runtime_contract_image():
     assert "docker build -t reclip-runtime-contract ./reclip" in commands
     assert "docker run --rm reclip-runtime-contract deno --version" in commands
     assert 'version("yt-dlp-ejs")' in commands
-
-
-def test_compose_wires_internal_bgutil_provider_to_reclip():
-    compose = load_yaml(COMPOSE_PATH)
-    bgutil = compose["services"]["bgutil"]
-    reclip = compose["services"]["reclip"]
-    assert bgutil["image"] == "brainicism/bgutil-ytdlp-pot-provider:1.3.1"
-    assert "ports" not in bgutil
-    assert "bgutil" in reclip["depends_on"]
-    assert "POT_PROVIDER_URL=http://bgutil:4416" in reclip["environment"]
 ```
 
 - [ ] **Step 2: Run the CI config test and observe failure**
 
 Run: `python -m pytest .github/tests/test_ci_config.py -k runtime_contract -v`
 
-Expected: FAIL because workflow does not build/inspect the runtime image and Compose has no BGUtil service.
+Expected: FAIL because workflow does not build or inspect the ReClip runtime image.
 
 - [ ] **Step 3: Add native runtime image verification to the test job**
 
@@ -1009,7 +1004,7 @@ Add after `Run ReClip tests` in `.github/workflows/release.yml`:
           docker run --rm reclip-runtime-contract python -c 'from importlib.metadata import version; print(version("yt-dlp-ejs"))'
 ```
 
-Add `bgutil` to source Compose with image `brainicism/bgutil-ytdlp-pot-provider:1.3.1`, only the existing `internal` network, `restart: unless-stopped`, and no host ports. Add `POT_PROVIDER_URL=http://bgutil:4416` plus `depends_on: [bgutil]` to ReClip. The existing release Buildx step remains responsible for application `linux/amd64,linux/arm64`; BGUtil is an external multi-arch image and must not enter the application build matrix. Do not duplicate remote YouTube extraction in CI because it is an unstable third-party network dependency.
+The existing release Buildx step remains responsible for application `linux/amd64,linux/arm64`; BGUtil is an external multi-arch image and must not enter the application build matrix. Do not duplicate remote YouTube extraction in CI because it is an unstable third-party network dependency.
 
 - [ ] **Step 4: Update README with exact user and local-runtime behavior**
 
@@ -1069,7 +1064,7 @@ Expected: API assertion passes. Remove only the explicitly named smoke container
 - [ ] **Step 7: Commit CI and documentation**
 
 ```bash
-git add .github/workflows/release.yml .github/tests/test_ci_config.py docker-compose.yml AGENTS.md README.md
+git add .github/workflows/release.yml .github/tests/test_ci_config.py AGENTS.md README.md
 git commit -m "Проверять русский YouTube runtime в CI"
 ```
 
