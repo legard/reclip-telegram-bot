@@ -77,6 +77,37 @@ def test_selector_has_language_filter_in_every_branch_and_never_falls_back():
     assert not selector.endswith("/best")
 
 
+def test_selector_orders_audio_only_and_combined_branches_within_each_codec_tier():
+    selector = build_russian_format_selector(720)
+
+    assert selector.split("/") == [
+        "bv[vcodec~='^(avc|h264)'][height=720]+ba[language~='^ru(?:-|$)']",
+        "b[vcodec~='^(avc|h264)'][height=720][language~='^ru(?:-|$)']",
+        "bv[height=720]+ba[language~='^ru(?:-|$)']",
+        "b[height=720][language~='^ru(?:-|$)']",
+    ]
+
+
+def test_best_russian_selector_keeps_branch_order_without_a_height_filter():
+    selector = build_russian_format_selector(None)
+
+    assert selector.split("/") == [
+        "bv[vcodec~='^(avc|h264)']+ba[language~='^ru(?:-|$)']",
+        "b[vcodec~='^(avc|h264)'][language~='^ru(?:-|$)']",
+        "bv+ba[language~='^ru(?:-|$)']",
+        "b[language~='^ru(?:-|$)']",
+    ]
+    assert "height=" not in selector
+
+
+def test_fresh_availability_accepts_a_combined_russian_track_at_requested_height():
+    localized = {"formats": [audio("ru720", "ru-RU", -10, height=720, video=True)]}
+
+    assert russian_download_available(localized, 720) is True
+    assert russian_download_available(localized, 1080) is False
+    assert russian_download_available(localized, None) is True
+
+
 def test_russian_extractor_args_use_mweb_and_internal_provider():
     assert build_russian_extractor_args("http://bgutil:4416/") == [
         "youtube:lang=ru;player_client=mweb",

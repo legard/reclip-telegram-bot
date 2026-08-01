@@ -39,6 +39,9 @@ logger = logging.getLogger(__name__)
 DOWNLOAD_DIR = os.environ.get("DOWNLOADS_PATH", os.path.join(os.path.dirname(__file__), "downloads"))
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 POT_PROVIDER_URL = os.environ.get("POT_PROVIDER_URL", "http://bgutil:4416")
+# Keep the server-side info request below the bot client's 60-second timeout.
+# The localized Russian probe is optional and shares this single deadline.
+INFO_REQUEST_TIMEOUT = 55
 
 MAX_CONCURRENT_DOWNLOADS = int(os.environ.get("MAX_CONCURRENT_DOWNLOADS", 3))
 # DOWNLOAD_TIMEOUT is retained as a backwards-compatible fallback for older
@@ -58,6 +61,7 @@ PROGRESS_TEMPLATE = (
 DOWNLOAD_DIAGNOSTIC_LINE_LIMIT = 20
 DOWNLOAD_DIAGNOSTIC_CHAR_LIMIT = 2048
 DOWNLOAD_ERROR_CHAR_LIMIT = 1500
+RUSSIAN_AUDIO_UNAVAILABLE_ERROR = "Russian audio track is no longer available. Please retry."
 URL_PATTERN = re.compile(r"https?://\S+", re.IGNORECASE)
 TOKEN_PATTERN = re.compile(
     r"(?<![A-Za-z0-9_-])\d{6,}:[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_-])"
@@ -296,9 +300,19 @@ def _probe_job_info(job, url):
     if result.returncode != 0:
         return None
     try:
-        return json.loads(result.stdout)
+        info = json.loads(result.stdout)
+        return info if isinstance(info, dict) else None
     except (TypeError, json.JSONDecodeError):
         return None
+
+
+def _russian_audio_is_confirmed_unavailable(info, height):
+    if not isinstance(info, dict):
+        return False
+    try:
+        return not russian_download_available(info, height)
+    except (AttributeError, TypeError):
+        return False
 
 
 def run_download(job_id, url, format_choice, format_id, audio_language=None, height=None):
@@ -327,7 +341,7 @@ def _do_download(job_id, url, format_choice, format_id, audio_language=None, hei
         if audio_language == "ru":
             info = _probe_job_info(job, url)
             if not russian_download_available(info or {}, height):
-                _finish_error(job, "Russian audio track is no longer available. Please retry.")
+                _finish_error(job, RUSSIAN_AUDIO_UNAVAILABLE_ERROR)
                 deadline_timer.cancel()
                 return
 
@@ -356,7 +370,19 @@ def _do_download(job_id, url, format_choice, format_id, audio_language=None, hei
 
     try:
         if returncode != 0:
-            _finish_error(job, summarize_download_error(stderr_lines))
+            error = summarize_download_error(stderr_lines)
+            if audio_language == "ru" and not job["_timed_out"].is_set():
+                try:
+                    revalidated_info = _probe_job_info(job, url)
+                except Exception:
+                    revalidated_info = None
+                if (
+                    not job["_timed_out"].is_set()
+                    and _russian_audio_is_confirmed_unavailable(revalidated_info, height)
+                ):
+                    error = RUSSIAN_AUDIO_UNAVAILABLE_ERROR
+            if not job["_timed_out"].is_set():
+                _finish_error(job, error)
             deadline_timer.cancel()
             return
 
@@ -503,12 +529,15 @@ def get_info():
         return jsonify({"error": "No URL provided"}), 400
 
     try:
-        info = fetch_info(url)
+        info_deadline = time.monotonic() + INFO_REQUEST_TIMEOUT
+        info = fetch_info(url, timeout=max(0, info_deadline - time.monotonic()))
         russian_audio = empty_russian_audio()
         if is_youtube_info(info):
+            remaining_timeout = info_deadline - time.monotonic()
             try:
-                localized_info = fetch_info(url, russian=True)
-                russian_audio = russian_audio_summary(info, localized_info)
+                if remaining_timeout > 0:
+                    localized_info = fetch_info(url, russian=True, timeout=remaining_timeout)
+                    russian_audio = russian_audio_summary(info, localized_info)
             except Exception as error:
                 logger.warning("localized Russian probe failed url=%s: %s", url, error)
 

@@ -1,6 +1,7 @@
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+import json
 
 import pytest
 
@@ -54,10 +55,61 @@ def test_info_adds_localized_russian_audio_summary(monkeypatch):
         "available": True,
         "formats": [{"height": 720, "label": "720p"}],
     }
-    assert calls == [
-        ("https://youtu.be/x", False, 60),
-        ("https://youtu.be/x", True, 60),
-    ]
+    assert calls[0][:2] == ("https://youtu.be/x", False)
+    assert 0 < calls[0][2] <= app.INFO_REQUEST_TIMEOUT
+    assert calls[1][:2] == ("https://youtu.be/x", True)
+    assert 0 < calls[1][2] <= app.INFO_REQUEST_TIMEOUT
+
+
+def test_info_returns_normal_result_when_localized_probe_times_out_in_remaining_budget(monkeypatch):
+    """The optional probe must not consume a second full client-timeout window."""
+    overall_budget = 55
+    normal = {
+        "title": "Video",
+        "extractor": "youtube",
+        "formats": [],
+    }
+    clock = [0.0]
+    timeouts = []
+
+    def fake_run(command, *, capture_output, text, timeout):
+        timeouts.append(timeout)
+        if "--extractor-args" in command:
+            clock[0] += timeout
+            raise app.subprocess.TimeoutExpired(command, timeout)
+
+        clock[0] += overall_budget - 0.25
+        return SimpleNamespace(returncode=0, stdout=json.dumps(normal), stderr="")
+
+    monkeypatch.setattr(app.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(app.subprocess, "run", fake_run)
+
+    response = app.app.test_client().post("/api/info", json={"url": "https://youtu.be/x"})
+
+    assert response.status_code == 200
+    assert response.get_json()["title"] == "Video"
+    assert response.get_json()["russian_audio"] == {"available": False, "formats": []}
+    assert timeouts == pytest.approx([overall_budget, 0.25])
+    assert clock[0] <= overall_budget
+
+
+def test_info_successful_localized_metadata_without_russian_formats_is_unavailable(monkeypatch):
+    normal = {"title": "Video", "extractor": "youtube", "formats": []}
+    localized = {
+        "formats": [
+            {"format_id": "en", "acodec": "aac", "vcodec": "none", "language": "en"}
+        ]
+    }
+
+    def fake_fetch(url, *, russian=False, timeout=60):
+        return localized if russian else normal
+
+    monkeypatch.setattr(app, "fetch_info", fake_fetch)
+
+    response = app.app.test_client().post("/api/info", json={"url": "https://youtu.be/x"})
+
+    assert response.status_code == 200
+    assert response.get_json()["russian_audio"] == {"available": False, "formats": []}
 
 
 def test_info_localized_probe_failure_preserves_normal_response(monkeypatch, caplog):
@@ -134,6 +186,16 @@ def test_legacy_best_video_command_is_unchanged():
     assert "--extractor-args" not in command
 
 
+def test_legacy_mp3_command_is_unchanged():
+    url = "https://example.com/video"
+
+    command = app.build_download_command("job-1", url, "audio", None)
+
+    assert command[command.index("-x"):] == ["-x", "--audio-format", "mp3", url]
+    assert "-f" not in command
+    assert "--extractor-args" not in command
+
+
 @pytest.mark.parametrize("payload", [
     {"url": "https://youtu.be/x", "audio_language": "de"},
     {"url": "https://youtu.be/x", "audio_language": "ru", "height": 0},
@@ -198,6 +260,86 @@ def test_russian_job_stops_before_download_when_track_disappears(monkeypatch):
 
     assert job["status"] == "error"
     assert job["error"] == "Russian audio track is no longer available. Please retry."
+
+
+@pytest.mark.parametrize(
+    ("revalidation", "expected_error"),
+    [
+        ({"formats": []}, "Russian audio track is no longer available. Please retry."),
+        (
+            {
+                "formats": [
+                    {"acodec": "aac", "vcodec": "none", "language": "ru"},
+                    {"acodec": "none", "vcodec": "h264", "height": 720},
+                ]
+            },
+            "ERROR: requested format is not available",
+        ),
+        (None, "ERROR: requested format is not available"),
+        ([], "ERROR: requested format is not available"),
+        ({"formats": "not-an-array"}, "ERROR: requested format is not available"),
+        (RuntimeError("localized probe failed"), "ERROR: requested format is not available"),
+    ],
+    ids=[
+        "track-disappeared",
+        "track-still-available",
+        "revalidation-failed",
+        "revalidation-invalid-metadata",
+        "revalidation-malformed-formats",
+        "revalidation-errors",
+    ],
+)
+def test_russian_selector_failure_is_classified_only_after_fresh_revalidation(
+    monkeypatch, revalidation, expected_error,
+):
+    """Only a fresh, successful probe may turn a selector error into the RU contract error."""
+    available = {
+        "formats": [
+            {"acodec": "aac", "vcodec": "none", "language": "ru"},
+            {"acodec": "none", "vcodec": "h264", "height": 720},
+        ]
+    }
+    probe_results = iter([available, revalidation])
+    probe_calls = []
+
+    class Timer:
+        def __init__(self, *args, **kwargs):
+            self.cancelled = False
+
+        def start(self):
+            pass
+
+        def cancel(self):
+            self.cancelled = True
+
+    class FailedProcess:
+        def __init__(self):
+            self.stderr = iter(["ERROR: requested format is not available\n"])
+
+        def wait(self):
+            return 1
+
+    def fake_probe(current_job, url):
+        probe_calls.append((current_job, url))
+        result = next(probe_results)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    job = app._new_job("job-1", "https://youtu.be/x", "Video")
+    app.jobs["job-1"] = job
+    monkeypatch.setattr(app.threading, "Timer", Timer)
+    monkeypatch.setattr(app, "_probe_job_info", fake_probe)
+    monkeypatch.setattr(app, "_start_job_process", lambda *args, **kwargs: FailedProcess())
+
+    try:
+        app._do_download("job-1", "https://youtu.be/x", "video", None, "ru", 720)
+    finally:
+        app.jobs.pop("job-1", None)
+
+    assert len(probe_calls) == 2
+    assert job["status"] == "error"
+    assert job["error"] == expected_error
 
 
 def test_ffmpeg_runner_discards_process_output(monkeypatch):
