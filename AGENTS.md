@@ -4,7 +4,7 @@ Compact instruction file for OpenCode sessions working in this repository.
 
 ## Project Overview
 
-Self-hosted Telegram bot that downloads media from YouTube, TikTok, Instagram, and 1000+ other sites. Built from four Dockerized Python services:
+Self-hosted Telegram bot that downloads media from YouTube, TikTok, Instagram, and 1000+ other sites. Built from five Dockerized services:
 
 | Service | Tech | Port | Role |
 |---------|------|------|------|
@@ -12,29 +12,41 @@ Self-hosted Telegram bot that downloads media from YouTube, TikTok, Instagram, a
 | `bot/` | python-telegram-bot + httpx | — | Telegram bot client |
 | `dashboard/` | FastAPI + aiosqlite + Jinja2 | 8080 | Admin panel with stats |
 | `telegram-bot-api` | aiogram/telegram-bot-api | 8081 | Self-hosted Bot API for 2GB uploads |
+| `bgutil` | BGUtil 1.3.1 provider | internal 4416 | YouTube Proof-of-Origin token provider for ReClip |
 
 ## Running Locally (No Docker)
 
 Start services in this order — each needs its own terminal:
 
 ```bash
-# 1. Reclip (download engine)
-cd reclip
-pip install flask yt-dlp
-python app.py                      # listens on 8899
+# 1. BGUtil provider (required for Russian YouTube audio)
+docker run --rm -p 4416:4416 brainicism/bgutil-ytdlp-pot-provider:1.3.1
 
-# 2. Dashboard (admin panel)
+# 2. Reclip (download engine)
+cd reclip
+# Deno >= 2.3.0 must be available in PATH.
+# This installs yt-dlp's bundled EJS and the pinned BGUtil provider plugin.
+pip install -r requirements.txt
+POT_PROVIDER_URL=http://localhost:4416 python app.py  # listens on 8899
+
+# 3. Dashboard (admin panel)
 cd dashboard
 pip install -r requirements.txt
 ADMIN_PASSWORD=changeme DB_PATH=./reclip.db \
   uvicorn main:create_app --factory --host 0.0.0.0 --port 8080
 
-# 3. Bot (Telegram client)
+# 4. Bot (Telegram client)
 cd bot
 pip install -r requirements.txt
 BOT_TOKEN=<token> RECLIP_URL=http://localhost:8899 \
   DOWNLOADS_PATH=../reclip/downloads python bot.py
 ```
+
+The ReClip runtime contract is Deno >= 2.3.0 in `PATH`, bundled EJS and the
+BGUtil plugin from `reclip/requirements.txt`, and a reachable BGUtil 1.3.1
+endpoint at `POT_PROVIDER_URL`. Docker Compose supplies the internal endpoint
+as `http://bgutil:4416`; local runs must point `POT_PROVIDER_URL` at their
+separately started provider.
 
 The bot waits up to 60s for the self-hosted Bot API server on startup. In Docker it talks to `http://telegram-bot-api:8081`; locally you need that container running too, or the bot will warn and start anyway (uploads >20MB will fail).
 

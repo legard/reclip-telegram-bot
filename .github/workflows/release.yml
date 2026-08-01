@@ -30,6 +30,14 @@ jobs:
       - name: Run ReClip tests
         run: python -m pytest reclip/tests -v
 
+      - name: Build ReClip runtime contract image
+        run: docker build -t reclip-runtime-contract ./reclip
+
+      - name: Verify ReClip runtime contract
+        run: |
+          docker run --rm reclip-runtime-contract deno --version
+          docker run --rm reclip-runtime-contract python -c 'from importlib.metadata import version; print(version("yt-dlp-ejs"))'
+
       - name: Run bot tests
         run: python -m pytest bot/tests -v
 

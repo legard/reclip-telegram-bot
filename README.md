@@ -11,6 +11,7 @@ Send a link, pick your format and quality, get the file delivered right in the c
 - Multi-platform support (YouTube, TikTok, Instagram, Twitter, Reddit, and 1000+ more via yt-dlp)
 - Format selection (MP4 video or MP3 audio)
 - Quality picker with all available resolutions
+- `MP4 • RU` Russian-audio picker for YouTube videos with a separate Russian track
 - Real-time download progress (percentage)
 - Thumbnail preview with metadata (title, platform, duration)
 - Files up to 2GB via self-hosted Telegram Bot API
@@ -38,11 +39,12 @@ Telegram User ──> Self-hosted Bot API (2GB limit)
                             SQLite
 ```
 
-Four Docker containers via docker-compose:
+Five Docker containers via docker-compose:
 1. **reclip** - Media download engine with REST API and web UI
 2. **bot** - Telegram bot that wraps reclip's API
 3. **telegram-bot-api** - Self-hosted Telegram Bot API server for 2GB upload limit
 4. **dashboard** - Admin panel with download stats, history, errors, and file management
+5. **bgutil** - Internal-only BGUtil 1.3.1 Proof-of-Origin token provider used by reclip for YouTube
 
 ## Quick Start
 
@@ -143,18 +145,29 @@ Then access it at http://localhost:8899.
 2. Bot sends "Fetching info..." immediately
 3. Bot calls reclip's API to get video metadata
 4. Bot displays thumbnail, title, platform, and format buttons (MP4/MP3)
-5. You tap MP4 to see quality options (1080p, 720p, etc.) or MP3 for audio
-6. Bot starts the download and shows real-time progress
-7. Bot uploads the file to the Telegram chat
-8. Cleanup task removes old files automatically
+5. When YouTube exposes a separate Russian track, bot also displays `MP4 • RU`; it opens Russian resolutions plus `Best quality`
+6. You tap MP4 to see ordinary quality options (1080p, 720p, etc.) or MP3 for audio
+7. `MP4 • RU` downloads only the selected Russian track and never substitutes the original audio
+8. Bot starts the download and shows real-time progress
+9. Bot uploads the file to the Telegram chat
+10. Cleanup task removes old files automatically
 
 ## Development
 
 ### Running locally (without Docker)
 
+ReClip needs Deno >= 2.3.0 in `PATH`. `pip install -r reclip/requirements.txt`
+installs yt-dlp's bundled EJS and the BGUtil provider plugin. Start a BGUtil
+1.3.1 endpoint separately and ensure it is reachable at `POT_PROVIDER_URL`
+(Docker Compose uses its internal-only `http://bgutil:4416` endpoint):
+
 ```bash
+# Start the BGUtil provider in another terminal
+docker run --rm -p 4416:4416 brainicism/bgutil-ytdlp-pot-provider:1.3.1
+
 # Start reclip
-cd reclip && pip install flask yt-dlp && python app.py &
+cd reclip && pip install -r requirements.txt
+POT_PROVIDER_URL=http://localhost:4416 python app.py &
 
 # Start the bot
 cd bot && pip install -r requirements.txt
@@ -165,7 +178,7 @@ BOT_TOKEN=your-token RECLIP_URL=http://localhost:8899 DOWNLOADS_PATH=../reclip/d
 
 ```
 reclip_bot/
-├── docker-compose.yml      # 4 services: reclip, bot, telegram-bot-api, dashboard
+├── docker-compose.yml      # 5 services: reclip, bot, telegram-bot-api, dashboard, internal bgutil
 ├── .env.example             # Environment variables template
 ├── bot/
 │   ├── bot.py               # Bot entry point

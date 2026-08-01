@@ -153,6 +153,15 @@ def test_release_runs_reclip_tests_and_installs_requirements():
     assert "python -m pytest reclip/tests -v" in commands
 
 
+def test_release_builds_and_executes_reclip_runtime_contract_image():
+    workflow = load_yaml(WORKFLOW_PATH)
+    commands = "\n".join(step.get("run", "") for step in workflow["jobs"]["test"]["steps"])
+
+    assert "docker build -t reclip-runtime-contract ./reclip" in commands
+    assert "docker run --rm reclip-runtime-contract deno --version" in commands
+    assert 'version("yt-dlp-ejs")' in commands
+
+
 def test_release_is_multi_arch_and_immutable():
     workflow = load_yaml(WORKFLOW_PATH)
     values = _build_step(workflow)["with"]
