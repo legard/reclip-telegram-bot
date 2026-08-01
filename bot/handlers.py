@@ -598,6 +598,9 @@ async def russian_quality_callback(update: Update, context: ContextTypes.DEFAULT
     if len(parts) != 4:
         return
     _, msg_id_str, uhash, height_value = parts
+    if not msg_id_str.isdecimal():
+        await query.edit_message_text("Session expired. Please send the link again.")
+        return
     msg_id = int(msg_id_str)
 
     key = _state_key(query.message.chat_id, msg_id, uhash)

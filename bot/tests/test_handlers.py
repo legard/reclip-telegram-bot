@@ -150,6 +150,15 @@ async def test_russian_quality_callback_rejects_malformed_height():
 
 
 @pytest.mark.asyncio
+async def test_russian_quality_callback_rejects_malformed_message_id():
+    query = FakeQuery(data="ruqty:not-an-id:abcd:720", chat_id=10, message_id=7)
+
+    await handlers.russian_quality_callback(FakeUpdate(query), None)
+
+    assert query.edited_text == "Session expired. Please send the link again."
+
+
+@pytest.mark.asyncio
 async def test_russian_quality_callback_passes_no_height_for_best(monkeypatch):
     calls = []
     query = FakeQuery(data="ruqty:7:abcd:best", chat_id=10, message_id=7)
@@ -280,9 +289,11 @@ def test_register_handlers_registers_russian_quality_callback():
 
     handlers.register_handlers(Application())
 
-    assert any(
-        isinstance(handler, handlers.CallbackQueryHandler)
+    matching_handlers = [
+        handler for handler in registered
+        if isinstance(handler, handlers.CallbackQueryHandler)
         and handler.callback == handlers.russian_quality_callback
         and handler.pattern.pattern == "^ruqty:"
-        for handler in registered
-    )
+    ]
+
+    assert len(matching_handlers) == 1
