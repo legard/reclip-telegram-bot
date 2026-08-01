@@ -289,11 +289,11 @@ def test_register_handlers_registers_russian_quality_callback():
 
     handlers.register_handlers(Application())
 
-    matching_handlers = [
+    ruqty_handlers = [
         handler for handler in registered
         if isinstance(handler, handlers.CallbackQueryHandler)
-        and handler.callback == handlers.russian_quality_callback
         and handler.pattern.pattern == "^ruqty:"
     ]
 
-    assert len(matching_handlers) == 1
+    assert len(ruqty_handlers) == 1
+    assert ruqty_handlers[0].callback == handlers.russian_quality_callback
