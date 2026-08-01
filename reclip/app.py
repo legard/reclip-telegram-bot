@@ -13,10 +13,26 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from flask import Flask, request, jsonify, send_file, render_template
 
+try:
+    from youtube_audio import (
+        build_russian_extractor_args,
+        empty_russian_audio,
+        is_youtube_info,
+        russian_audio_summary,
+    )
+except ImportError:
+    from reclip.youtube_audio import (
+        build_russian_extractor_args,
+        empty_russian_audio,
+        is_youtube_info,
+        russian_audio_summary,
+    )
+
 app = Flask(__name__)
 logger = logging.getLogger(__name__)
 DOWNLOAD_DIR = os.environ.get("DOWNLOADS_PATH", os.path.join(os.path.dirname(__file__), "downloads"))
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+POT_PROVIDER_URL = os.environ.get("POT_PROVIDER_URL", "http://bgutil:4416")
 
 MAX_CONCURRENT_DOWNLOADS = int(os.environ.get("MAX_CONCURRENT_DOWNLOADS", 3))
 # DOWNLOAD_TIMEOUT is retained as a backwards-compatible fallback for older
@@ -108,6 +124,28 @@ def summarize_download_error(diagnostics):
     summary = URL_PATTERN.sub("[URL]", summary)
     summary = TOKEN_PATTERN.sub("[TOKEN]", summary)
     return summary[-DOWNLOAD_ERROR_CHAR_LIMIT:]
+
+
+def build_info_command(url, *, russian=False):
+    command = ["yt-dlp", "--no-playlist", "-J"]
+    if russian:
+        for extractor_arg in build_russian_extractor_args(POT_PROVIDER_URL):
+            command += ["--extractor-args", extractor_arg]
+    command.append(url)
+    return command
+
+
+def fetch_info(url, *, russian=False, timeout=60):
+    result = subprocess.run(
+        build_info_command(url, russian=russian),
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    if result.returncode != 0:
+        message = result.stderr.strip().split("\n")[-1] or "Failed to fetch video info"
+        raise ValueError(message)
+    return json.loads(result.stdout)
 
 
 def run_ffmpeg(command, timeout):
@@ -417,13 +455,15 @@ def get_info():
     if not url:
         return jsonify({"error": "No URL provided"}), 400
 
-    cmd = ["yt-dlp", "--no-playlist", "-j", url]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-        if result.returncode != 0:
-            return jsonify({"error": result.stderr.strip().split("\n")[-1]}), 400
-
-        info = json.loads(result.stdout)
+        info = fetch_info(url)
+        russian_audio = empty_russian_audio()
+        if is_youtube_info(info):
+            try:
+                localized_info = fetch_info(url, russian=True)
+                russian_audio = russian_audio_summary(info, localized_info)
+            except Exception as error:
+                logger.warning("localized Russian probe failed url=%s: %s", url, error)
 
         # Build quality options — keep best format per resolution
         best_by_height = {}
@@ -450,6 +490,7 @@ def get_info():
             "uploader": info.get("uploader", ""),
             "extractor": info.get("extractor", ""),
             "formats": formats,
+            "russian_audio": russian_audio,
         })
     except subprocess.TimeoutExpired:
         return jsonify({"error": "Timed out fetching video info"}), 400

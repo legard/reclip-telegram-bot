@@ -7,6 +7,92 @@ import pytest
 from reclip import app
 
 
+def test_info_adds_localized_russian_audio_summary(monkeypatch):
+    normal = {
+        "title": "Video",
+        "extractor": "youtube",
+        "formats": [
+            {
+                "format_id": "en",
+                "acodec": "aac",
+                "vcodec": "none",
+                "language": "en",
+                "language_preference": 10,
+                "format_note": "original",
+            },
+            {
+                "format_id": "v720",
+                "acodec": "none",
+                "vcodec": "h264",
+                "height": 720,
+                "tbr": 1000,
+            },
+        ],
+    }
+    localized = {
+        "formats": [
+            {
+                "format_id": "ru",
+                "acodec": "aac",
+                "vcodec": "none",
+                "language": "ru",
+            }
+        ]
+    }
+    calls = []
+
+    def fake_fetch(url, *, russian=False, timeout=60):
+        calls.append((url, russian, timeout))
+        return localized if russian else normal
+
+    monkeypatch.setattr(app, "fetch_info", fake_fetch)
+
+    response = app.app.test_client().post("/api/info", json={"url": "https://youtu.be/x"})
+
+    assert response.status_code == 200
+    assert response.get_json()["russian_audio"] == {
+        "available": True,
+        "formats": [{"height": 720, "label": "720p"}],
+    }
+    assert calls == [
+        ("https://youtu.be/x", False, 60),
+        ("https://youtu.be/x", True, 60),
+    ]
+
+
+def test_info_localized_probe_failure_preserves_normal_response(monkeypatch, caplog):
+    normal = {"title": "Video", "extractor": "youtube", "formats": []}
+
+    def fake_fetch(url, *, russian=False, timeout=60):
+        if russian:
+            raise RuntimeError("localized probe failed")
+        return normal
+
+    monkeypatch.setattr(app, "fetch_info", fake_fetch)
+
+    response = app.app.test_client().post("/api/info", json={"url": "https://youtu.be/x"})
+
+    assert response.status_code == 200
+    assert response.get_json()["russian_audio"] == {"available": False, "formats": []}
+    assert "localized Russian probe failed" in caplog.text
+
+
+def test_info_non_youtube_does_not_run_localized_probe(monkeypatch):
+    calls = []
+
+    def fake_fetch(url, *, russian=False, timeout=60):
+        calls.append(russian)
+        return {"extractor": "vimeo", "formats": []}
+
+    monkeypatch.setattr(app, "fetch_info", fake_fetch)
+
+    response = app.app.test_client().post("/api/info", json={"url": "https://vimeo.com/1"})
+
+    assert response.status_code == 200
+    assert response.get_json()["russian_audio"] == {"available": False, "formats": []}
+    assert calls == [False]
+
+
 def test_download_command_limits_fragment_concurrency():
     command = app.build_download_command(
         "job-1",
