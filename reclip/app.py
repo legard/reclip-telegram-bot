@@ -62,6 +62,8 @@ DOWNLOAD_DIAGNOSTIC_LINE_LIMIT = 20
 DOWNLOAD_DIAGNOSTIC_CHAR_LIMIT = 2048
 DOWNLOAD_ERROR_CHAR_LIMIT = 1500
 RUSSIAN_AUDIO_UNAVAILABLE_ERROR = "Russian audio track is no longer available. Please retry."
+FFMPEG_TIMEOUT_EXIT_CODE = 146
+DOWNLOAD_RETRY_DELAYS = (2, 5)
 URL_PATTERN = re.compile(r"https?://\S+", re.IGNORECASE)
 TOKEN_PATTERN = re.compile(
     r"(?<![A-Za-z0-9_-])\d{6,}:[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_-])"
@@ -74,7 +76,7 @@ def build_download_command(job_id, url, format_choice, format_id, audio_language
         "yt-dlp", "--no-playlist", "-o", out_template,
         "--progress-template", PROGRESS_TEMPLATE,
         "--force-ipv4",
-        "--downloader", "hls:ffmpeg",
+        "--downloader", "m3u8:ffmpeg",
         "--concurrent-fragments", "2",
         "--socket-timeout", "20",
         "--retries", "5",
@@ -138,6 +140,13 @@ def summarize_download_error(diagnostics):
     summary = URL_PATTERN.sub("[URL]", summary)
     summary = TOKEN_PATTERN.sub("[TOKEN]", summary)
     return summary[-DOWNLOAD_ERROR_CHAR_LIMIT:]
+
+
+def is_retryable_download_timeout(returncode, diagnostics):
+    return (
+        returncode == FFMPEG_TIMEOUT_EXIT_CODE
+        and any("Connection timed out" in line for line in diagnostics)
+    )
 
 
 def build_info_command(url, *, russian=False):
@@ -331,6 +340,21 @@ def run_download(job_id, url, format_choice, format_id, audio_language=None, hei
         download_semaphore.release()
 
 
+def _run_download_attempt(job, command):
+    stderr_lines = deque(maxlen=DOWNLOAD_DIAGNOSTIC_LINE_LIMIT)
+    process = _start_job_process(
+        job, command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+    )
+    if process is None:
+        return None, stderr_lines
+    try:
+        for line in process.stderr:
+            record_download_output(job, stderr_lines, line.rstrip("\n"))
+        return process.wait(), stderr_lines
+    finally:
+        _clear_job_process(job, process)
+
+
 def _do_download(job_id, url, format_choice, format_id, audio_language=None, height=None):
     job = jobs[job_id]
 
@@ -339,7 +363,6 @@ def _do_download(job_id, url, format_choice, format_id, audio_language=None, hei
     deadline_timer.daemon = True
     deadline_timer.start()
 
-    stderr_lines = deque(maxlen=DOWNLOAD_DIAGNOSTIC_LINE_LIMIT)
     try:
         if audio_language == "ru":
             info = _probe_job_info(job, url)
@@ -349,18 +372,25 @@ def _do_download(job_id, url, format_choice, format_id, audio_language=None, hei
                 return
 
         cmd = build_download_command(job_id, url, format_choice, format_id, audio_language, height)
-        process = _start_job_process(
-            job, cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
-        )
-        if process is None:
-            deadline_timer.cancel()
-            return
-        try:
-            for line in process.stderr:
-                record_download_output(job, stderr_lines, line.rstrip("\n"))
-            returncode = process.wait()
-        finally:
-            _clear_job_process(job, process)
+        for attempt in range(len(DOWNLOAD_RETRY_DELAYS) + 1):
+            returncode, stderr_lines = _run_download_attempt(job, cmd)
+            if returncode in (None, 0) or job["_timed_out"].is_set():
+                break
+            if (
+                attempt == len(DOWNLOAD_RETRY_DELAYS)
+                or not is_retryable_download_timeout(returncode, stderr_lines)
+            ):
+                break
+
+            delay = DOWNLOAD_RETRY_DELAYS[attempt]
+            logger.info(
+                "job_id=%s retry=%s reason=ffmpeg_connection_timeout",
+                job_id,
+                attempt + 1,
+            )
+            _cleanup_job_files(job_id)
+            if job["_timed_out"].wait(delay):
+                break
     except Exception:
         if not job["_timed_out"].is_set():
             _finish_error(job, "Download failed")
@@ -368,6 +398,10 @@ def _do_download(job_id, url, format_choice, format_id, audio_language=None, hei
         return
 
     if job["_timed_out"].is_set():
+        deadline_timer.cancel()
+        return
+
+    if returncode is None:
         deadline_timer.cancel()
         return
 
