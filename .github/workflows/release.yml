@@ -36,6 +36,16 @@ jobs:
       - name: Verify ReClip runtime contract
         run: |
           docker run --rm reclip-runtime-contract deno --version
+          docker run --rm reclip-runtime-contract deno eval '
+            const minimum = [2, 3, 0];
+            const actual = Deno.version.deno.split(".").map(Number);
+            for (let index = 0; index < minimum.length; index += 1) {
+              if (actual[index] > minimum[index]) break;
+              if (actual[index] < minimum[index]) {
+                throw new Error(`Deno ${Deno.version.deno} is below required 2.3.0`);
+              }
+            }
+          '
           docker run --rm reclip-runtime-contract python -c 'from importlib.metadata import version; print(version("yt-dlp-ejs"))'
 
       - name: Run bot tests

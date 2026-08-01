@@ -155,11 +155,19 @@ def test_release_runs_reclip_tests_and_installs_requirements():
 
 def test_release_builds_and_executes_reclip_runtime_contract_image():
     workflow = load_yaml(WORKFLOW_PATH)
-    commands = "\n".join(step.get("run", "") for step in workflow["jobs"]["test"]["steps"])
+    steps = workflow["jobs"]["test"]["steps"]
+    commands = "\n".join(step.get("run", "") for step in steps)
+    runtime_contract = next(
+        step["run"] for step in steps if step.get("name") == "Verify ReClip runtime contract"
+    )
 
     assert "docker build -t reclip-runtime-contract ./reclip" in commands
-    assert "docker run --rm reclip-runtime-contract deno --version" in commands
-    assert 'version("yt-dlp-ejs")' in commands
+    assert "docker run --rm reclip-runtime-contract deno --version" in runtime_contract
+    assert "docker run --rm reclip-runtime-contract deno eval" in runtime_contract
+    assert "Deno.version.deno.split(\".\").map(Number)" in runtime_contract
+    assert "const minimum = [2, 3, 0]" in runtime_contract
+    assert "below required 2.3.0" in runtime_contract
+    assert 'version("yt-dlp-ejs")' in runtime_contract
 
 
 def test_release_is_multi_arch_and_immutable():

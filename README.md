@@ -34,6 +34,10 @@ Telegram User ──> Self-hosted Bot API (2GB limit)
                    ▼              ▼
               reclip (Flask)   dashboard (FastAPI)
               port 8899        port 8080
+                   ▲
+                   │ internal-only
+              bgutil (BGUtil 1.3.1)
+              port 4416
                                │
                                ▼
                             SQLite
@@ -154,7 +158,7 @@ Then access it at http://localhost:8899.
 
 ## Development
 
-### Running locally (without Docker)
+### Running locally (without Docker Compose)
 
 ReClip needs Deno >= 2.3.0 in `PATH`. `pip install -r reclip/requirements.txt`
 installs yt-dlp's bundled EJS and the BGUtil provider plugin. Start a BGUtil

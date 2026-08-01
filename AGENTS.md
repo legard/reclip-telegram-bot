@@ -14,7 +14,7 @@ Self-hosted Telegram bot that downloads media from YouTube, TikTok, Instagram, a
 | `telegram-bot-api` | aiogram/telegram-bot-api | 8081 | Self-hosted Bot API for 2GB uploads |
 | `bgutil` | BGUtil 1.3.1 provider | internal 4416 | YouTube Proof-of-Origin token provider for ReClip |
 
-## Running Locally (No Docker)
+## Running Locally (Without Docker Compose)
 
 Start services in this order — each needs its own terminal:
 
