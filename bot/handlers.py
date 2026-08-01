@@ -382,13 +382,18 @@ def _format_duration(seconds: int | float | None) -> str:
     return f"{mins}:{secs:02d}"
 
 
-def _build_format_buttons(message_id: int, url_hash: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("MP4", callback_data=f"fmt:{message_id}:{url_hash}:video"),
-            InlineKeyboardButton("MP3", callback_data=f"fmt:{message_id}:{url_hash}:audio"),
-        ]
-    ])
+def _build_format_buttons(
+    message_id: int, url_hash: str, russian_audio: dict | None = None
+) -> InlineKeyboardMarkup:
+    buttons = [
+        InlineKeyboardButton("MP4", callback_data=f"fmt:{message_id}:{url_hash}:video")
+    ]
+    if (russian_audio or {}).get("available"):
+        buttons.append(
+            InlineKeyboardButton("MP4 • RU", callback_data=f"fmt:{message_id}:{url_hash}:video_ru")
+        )
+    buttons.append(InlineKeyboardButton("MP3", callback_data=f"fmt:{message_id}:{url_hash}:audio"))
+    return InlineKeyboardMarkup([buttons])
 
 
 def _build_quality_buttons(message_id: int, url_hash: str, formats: list[dict]) -> InlineKeyboardMarkup:
@@ -400,6 +405,23 @@ def _build_quality_buttons(message_id: int, url_hash: str, formats: list[dict]) 
         )
     rows = [buttons[i : i + 3] for i in range(0, len(buttons), 3)]
     rows.append([InlineKeyboardButton("Best quality", callback_data=f"qty:{message_id}:{url_hash}:best")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _build_russian_quality_buttons(
+    message_id: int, url_hash: str, formats: list[dict]
+) -> InlineKeyboardMarkup:
+    buttons = [
+        InlineKeyboardButton(
+            fmt.get("label", f'{fmt["height"]}p'),
+            callback_data=f'ruqty:{message_id}:{url_hash}:{fmt["height"]}',
+        )
+        for fmt in formats
+    ]
+    rows = [buttons[index:index + 3] for index in range(0, len(buttons), 3)]
+    rows.append([
+        InlineKeyboardButton("Best quality", callback_data=f"ruqty:{message_id}:{url_hash}:best")
+    ])
     return InlineKeyboardMarkup(rows)
 
 
@@ -454,7 +476,9 @@ async def url_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "created": time.time(),
         }
 
-        keyboard = _build_format_buttons(status_msg.message_id, uhash)
+        keyboard = _build_format_buttons(
+            status_msg.message_id, uhash, info.get("russian_audio")
+        )
 
         if thumbnail:
             try:
@@ -508,7 +532,9 @@ async def format_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if fmt == "back":
-        keyboard = _build_format_buttons(query.message.message_id, uhash)
+        keyboard = _build_format_buttons(
+            query.message.message_id, uhash, entry["info"].get("russian_audio")
+        )
         await query.edit_message_reply_markup(reply_markup=keyboard)
         return
 
@@ -525,6 +551,15 @@ async def format_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         keyboard = _build_quality_buttons(query.message.message_id, uhash, formats[:6])
+        await query.edit_message_reply_markup(reply_markup=keyboard)
+    elif fmt == "video_ru":
+        russian_audio = entry["info"].get("russian_audio") or {}
+        formats = russian_audio.get("formats", [])
+        if not formats:
+            await query.edit_message_text("Session expired. Please send the link again.")
+            return
+
+        keyboard = _build_russian_quality_buttons(query.message.message_id, uhash, formats)
         await query.edit_message_reply_markup(reply_markup=keyboard)
 
 
@@ -554,7 +589,55 @@ async def quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def download_and_send(query, entry: dict, format: str, format_id: str | None):
+async def russian_quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _evict_stale()
+    query = update.callback_query
+    await query.answer()
+
+    parts = query.data.split(":")
+    if len(parts) != 4:
+        return
+    _, msg_id_str, uhash, height_value = parts
+    msg_id = int(msg_id_str)
+
+    key = _state_key(query.message.chat_id, msg_id, uhash)
+    entry = _state.get(key)
+    if not entry:
+        key = _state_key(query.message.chat_id, query.message.message_id, uhash)
+        entry = _state.get(key)
+    if not entry:
+        await query.edit_message_text("Session expired. Please send the link again.")
+        return
+
+    if height_value == "best":
+        height = None
+    elif height_value.isdecimal():
+        height = int(height_value)
+    else:
+        await query.edit_message_text("Session expired. Please send the link again.")
+        return
+
+    asyncio.create_task(
+        download_and_send(
+            query,
+            entry,
+            format="video",
+            format_id=None,
+            audio_language="ru",
+            height=height,
+        )
+    )
+
+
+async def download_and_send(
+    query,
+    entry: dict,
+    format: str,
+    format_id: str | None,
+    *,
+    audio_language: str | None = None,
+    height: int | None = None,
+):
     chat_id = query.message.chat_id
     message = query.message
     url = entry["url"]
@@ -566,7 +649,14 @@ async def download_and_send(query, entry: dict, format: str, format_id: str | No
         pass
 
     try:
-        job_id = await start_download(url, format, format_id, title)
+        job_id = await start_download(
+            url,
+            format,
+            format_id,
+            title,
+            audio_language=audio_language,
+            height=height,
+        )
     except ReclipServiceDown:
         await _edit_safe(message, "Download service temporarily unavailable.")
         _stats["errors"] += 1
@@ -589,7 +679,7 @@ async def download_and_send(query, entry: dict, format: str, format_id: str | No
             url=url,
             platform=entry["info"].get("extractor", "unknown"),
             format=format,
-            quality=format_id or "best",
+            quality=str(height) if height is not None else (format_id or "best"),
             title=title,
         )
     except Exception:
@@ -687,3 +777,4 @@ def register_handlers(application):
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, url_handler))
     application.add_handler(CallbackQueryHandler(format_callback, pattern=r"^fmt:"))
     application.add_handler(CallbackQueryHandler(quality_callback, pattern=r"^qty:"))
+    application.add_handler(CallbackQueryHandler(russian_quality_callback, pattern=r"^ruqty:"))
