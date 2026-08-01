@@ -26,7 +26,6 @@
 
 - Create `reclip/youtube_audio.py` — чистые правила распознавания YouTube/русского языка, определения исходной дорожки, построения списка высот, проверки свежих форматов и безопасного yt-dlp selector.
 - Create `reclip/tests/test_youtube_audio.py` — табличные unit-тесты доменных правил и доказательство отсутствия fallback.
-- Create `reclip/tests/test_image_contract.py` — статический контракт Deno и bundled EJS в Docker image.
 - Modify `reclip/app.py` — orchestration обычного/локализованного probe, API schema/validation, job arguments и свежая проверка перед download.
 - Modify `reclip/tests/test_app.py` — Flask API и job orchestration tests при сохранении существующих deadline/process tests.
 - Modify `reclip/Dockerfile` — multi-stage Deno binary и установка `requirements.txt`.
@@ -47,7 +46,6 @@
 ### Task 1: Docker runtime contract and extraction feasibility gate
 
 **Files:**
-- Create: `reclip/tests/test_image_contract.py`
 - Modify: `reclip/Dockerfile:1-16`
 - Modify: `reclip/requirements.txt:1-2`
 
@@ -55,37 +53,18 @@
 - Consumes: official [yt-dlp EJS setup](https://github.com/yt-dlp/yt-dlp/wiki/EJS) and [Deno Docker binary image](https://github.com/denoland/deno_docker#using-your-own-base-image).
 - Produces: `deno` in `/usr/local/bin`, bundled `yt-dlp-ejs`, and a verified baseline extractor argument `youtube:lang=ru` for all later ReClip probes.
 
-- [ ] **Step 1: Write the failing image-contract tests**
+- [ ] **Step 1: Build the baseline image and observe the missing runtime contracts**
 
-```python
-from pathlib import Path
-
-
-RECLIP_DIR = Path(__file__).resolve().parents[1]
-
-
-def test_reclip_image_contains_pinned_multi_arch_deno_binary():
-    dockerfile = (RECLIP_DIR / "Dockerfile").read_text()
-    assert "FROM denoland/deno:bin-2.9.4 AS deno" in dockerfile
-    assert "COPY --from=deno /deno /usr/local/bin/deno" in dockerfile
-
-
-def test_reclip_installs_bundled_ejs_dependency_group():
-    dockerfile = (RECLIP_DIR / "Dockerfile").read_text()
-    requirements = (RECLIP_DIR / "requirements.txt").read_text().splitlines()
-    assert "COPY requirements.txt ." in dockerfile
-    assert "pip install --no-cache-dir -r requirements.txt" in dockerfile
-    assert "yt-dlp[default]" in requirements
-    assert "yt-dlp" not in requirements
+```bash
+docker build -t reclip-russian-audio-red ./reclip
+docker run --rm reclip-russian-audio-red deno --version
+docker run --rm reclip-russian-audio-red \
+  python -c 'from importlib.metadata import version; print(version("yt-dlp-ejs"))'
 ```
 
-- [ ] **Step 2: Run the contract tests and observe the expected failure**
+Expected RED: image build succeeds; `deno --version` fails because the executable is absent, and the metadata command fails with `PackageNotFoundError` because plain `yt-dlp` does not install bundled EJS. These are the two production changes the runtime gate must catch.
 
-Run: `python -m pytest reclip/tests/test_image_contract.py -v`
-
-Expected: both tests FAIL because the current image has no Deno stage and installs plain `yt-dlp` inline.
-
-- [ ] **Step 3: Make the minimal reproducible runtime change**
+- [ ] **Step 2: Make the minimal reproducible runtime change**
 
 Replace `reclip/Dockerfile` with:
 
@@ -120,13 +99,7 @@ flask
 yt-dlp[default]
 ```
 
-- [ ] **Step 4: Run the static contract tests**
-
-Run: `python -m pytest reclip/tests/test_image_contract.py -v`
-
-Expected: 2 passed.
-
-- [ ] **Step 5: Build the exact candidate image and verify runtime/EJS without network-time component downloads**
+- [ ] **Step 3: Build the exact candidate image and verify runtime/EJS without network-time component downloads**
 
 ```bash
 docker build -t reclip-russian-audio-feasibility ./reclip
@@ -137,7 +110,7 @@ docker run --rm reclip-russian-audio-feasibility \
 
 Expected: image builds; Deno reports `2.9.4`; both Python distributions print installed versions. Do not add `--remote-components` because EJS must already be in the image.
 
-- [ ] **Step 6: Run the localized extraction three times inside the candidate image**
+- [ ] **Step 4: Run the localized extraction three times inside the candidate image**
 
 ```bash
 for attempt in 1 2 3; do
@@ -157,14 +130,14 @@ done
 
 Expected: all three pipelines exit 0 and print at least one Russian-audio height or confirm an audio-only Russian format. Warnings about SABR/PO Token do not change the baseline while the required formats remain available.
 
-- [ ] **Step 7: Enforce the feasibility decision gate**
+- [ ] **Step 5: Enforce the feasibility decision gate**
 
 If any attempt cannot expose Russian audio with Deno + bundled EJS + `youtube:lang=ru`, stop implementation and preserve the command output. Do not add cookies, Visitor Data, PO Token, `mweb`, or remote EJS; report the failed gate for explicit user direction. If all attempts pass, later code uses only `youtube:lang=ru`; Deno remains enabled by yt-dlp's default runtime policy, so no redundant `--js-runtimes` flag is added.
 
-- [ ] **Step 8: Commit the runtime contract**
+- [ ] **Step 6: Commit the runtime contract**
 
 ```bash
-git add reclip/Dockerfile reclip/requirements.txt reclip/tests/test_image_contract.py
+git add reclip/Dockerfile reclip/requirements.txt
 git commit -m "Добавить runtime для русских дорожек YouTube"
 ```
 
@@ -492,7 +465,7 @@ Expected: new info tests pass.
 
 Run: `python -m pytest reclip/tests -v`
 
-Expected: all existing process, timeout, compose, image, and discovery tests pass.
+Expected: all existing process, timeout, compose, and discovery tests pass.
 
 - [ ] **Step 5: Commit the API discovery contract**
 
