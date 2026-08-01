@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import json
 
 import pytest
+from yt_dlp import parse_options
 
 from reclip import app
 
@@ -157,6 +158,33 @@ def test_download_command_limits_fragment_concurrency():
     assert command[fragments_index + 1] == "2"
 
 
+def test_download_command_scopes_ffmpeg_to_m3u8_protocol():
+    command = app.build_download_command(
+        "job-1",
+        "https://example.com/video",
+        "video",
+        None,
+    )
+
+    options = parse_options(command[1:]).ydl_opts
+
+    assert options["external_downloader"] == {"m3u8": "ffmpeg"}
+
+
+@pytest.mark.parametrize(
+    ("returncode", "diagnostics", "expected"),
+    [
+        (146, ["[tls] IO error: Connection timed out"], True),
+        (146, ["ERROR: requested format is not available"], False),
+        (1, ["[tls] IO error: Connection timed out"], False),
+    ],
+)
+def test_retryable_download_timeout_requires_ffmpeg_timeout_signature(
+    returncode, diagnostics, expected,
+):
+    assert app.is_retryable_download_timeout(returncode, diagnostics) is expected
+
+
 def test_russian_download_command_uses_localized_selector_without_fallback():
     command = app.build_download_command(
         "job-1", "https://youtu.be/x", "video", None,
@@ -260,6 +288,69 @@ def test_russian_job_stops_before_download_when_track_disappears(monkeypatch):
 
     assert job["status"] == "error"
     assert job["error"] == "Russian audio track is no longer available. Please retry."
+
+
+def test_download_retries_ffmpeg_timeout_and_removes_partial_output(monkeypatch, tmp_path):
+    class Timer:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+        def cancel(self):
+            pass
+
+    class Process:
+        def __init__(self, returncode, diagnostics, on_wait=None):
+            self.returncode = returncode
+            self.stderr = iter(diagnostics)
+            self._on_wait = on_wait
+
+        def wait(self):
+            if self._on_wait:
+                self._on_wait()
+            return self.returncode
+
+    partial = tmp_path / "job-1.part"
+    completed = tmp_path / "job-1.mp4"
+    processes = iter([
+        Process(146, ["[tls] IO error: Connection timed out\n"], lambda: partial.write_text("partial")),
+        Process(0, [], lambda: completed.write_text("video")),
+    ])
+    starts = []
+
+    def start_process(*args, **kwargs):
+        starts.append(args[1])
+        return next(processes)
+
+    def run_process(job, command, *, capture_output=False):
+        if command[0] == "ffprobe" and "codec_name" in command:
+            return SimpleNamespace(returncode=0, stdout="h264\n", stderr="")
+        if command[0] == "ffprobe":
+            return SimpleNamespace(
+                returncode=0,
+                stdout='{"streams": [{"width": 1280, "height": 720}], "format": {"duration": "1"}}',
+                stderr="",
+            )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(app, "DOWNLOAD_DIR", str(tmp_path))
+    monkeypatch.setattr(app, "DOWNLOAD_RETRY_DELAYS", (0, 0))
+    monkeypatch.setattr(app.threading, "Timer", Timer)
+    monkeypatch.setattr(app, "_start_job_process", start_process)
+    monkeypatch.setattr(app, "_run_job_process", run_process)
+    job = app._new_job("job-1", "https://youtu.be/x", "Video")
+    app.jobs["job-1"] = job
+
+    try:
+        app._do_download("job-1", "https://youtu.be/x", "video", None)
+    finally:
+        app.jobs.pop("job-1", None)
+
+    assert len(starts) == 2
+    assert not partial.exists()
+    assert job["status"] == "done"
 
 
 @pytest.mark.parametrize(
