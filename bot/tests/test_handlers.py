@@ -20,11 +20,12 @@ def button_callbacks(markup):
 
 
 class FakeQuery:
-    def __init__(self, *, data, chat_id, message_id):
+    def __init__(self, *, data, chat_id, message_id, photo=False):
         self.data = data
-        self.message = SimpleNamespace(chat_id=chat_id, message_id=message_id)
+        self.message = SimpleNamespace(chat_id=chat_id, message_id=message_id, photo=photo)
         self.reply_markup = None
         self.edited_text = None
+        self.edited_caption = None
 
     async def answer(self):
         pass
@@ -32,8 +33,13 @@ class FakeQuery:
     async def edit_message_reply_markup(self, *, reply_markup):
         self.reply_markup = reply_markup
 
-    async def edit_message_text(self, text):
+    async def edit_message_text(self, text, **kwargs):
         self.edited_text = text
+        self.reply_markup = kwargs.get("reply_markup", self.reply_markup)
+
+    async def edit_message_caption(self, caption, **kwargs):
+        self.edited_caption = caption
+        self.reply_markup = kwargs.get("reply_markup", self.reply_markup)
 
 
 class FakeUpdate:
@@ -91,9 +97,10 @@ def test_format_buttons_show_ru_only_when_available():
         7, "abcd", {"available": True, "formats": [{"height": 720, "label": "720p"}]}
     )
 
-    assert button_texts(hidden) == ["MP4", "MP3"]
-    assert button_texts(shown) == ["MP4", "MP4 • RU", "MP3"]
+    assert button_texts(hidden) == ["MP4", "MP3", "Cancel"]
+    assert button_texts(shown) == ["MP4", "MP4 • RU", "MP3", "Cancel"]
     assert "fmt:7:abcd:video_ru" in button_callbacks(shown)
+    assert button_callbacks(hidden)[-1] == "cancel:7:abcd"
 
 
 def test_russian_quality_buttons_store_height_not_format_id():
@@ -103,9 +110,94 @@ def test_russian_quality_buttons_store_height_not_format_id():
     )
 
     assert button_callbacks(markup) == [
-        "ruqty:7:abcd:1080", "ruqty:7:abcd:720", "ruqty:7:abcd:best",
+        "ruqty:7:abcd:1080", "ruqty:7:abcd:720", "ruqty:7:abcd:best", "cancel:7:abcd",
     ]
-    assert button_texts(markup) == ["1080p", "720p", "Best quality"]
+    assert button_texts(markup) == ["1080p", "720p", "Best quality", "Cancel"]
+
+
+def test_quality_buttons_include_cancel():
+    markup = handlers._build_quality_buttons(7, "abcd", [{"id": "22", "label": "720p"}])
+
+    assert button_callbacks(markup) == ["qty:7:abcd:22", "qty:7:abcd:best", "cancel:7:abcd"]
+    assert button_texts(markup) == ["720p", "Best quality", "Cancel"]
+
+
+@pytest.mark.asyncio
+async def test_cancel_removes_session_and_replaces_text_card():
+    key = handlers._state_key(10, 7, "abcd")
+    handlers._state[key] = {"created": time.time()}
+    query = FakeQuery(data="cancel:7:abcd", chat_id=10, message_id=7)
+
+    await handlers.cancel_callback(FakeUpdate(query), None)
+
+    assert key not in handlers._state
+    assert query.edited_text == "Cancelled."
+    assert query.reply_markup is None
+
+
+@pytest.mark.asyncio
+async def test_cancel_removes_session_and_replaces_photo_caption():
+    key = handlers._state_key(10, 7, "abcd")
+    handlers._state[key] = {"created": time.time()}
+    query = FakeQuery(data="cancel:7:abcd", chat_id=10, message_id=7, photo=True)
+
+    await handlers.cancel_callback(FakeUpdate(query), None)
+
+    assert key not in handlers._state
+    assert query.edited_caption == "Cancelled."
+    assert query.reply_markup is None
+
+
+@pytest.mark.asyncio
+async def test_repeated_cancel_does_not_start_download(monkeypatch):
+    query = FakeQuery(data="cancel:7:abcd", chat_id=10, message_id=7)
+    started = []
+
+    def fail_if_started(*args, **kwargs):
+        started.append((args, kwargs))
+
+    monkeypatch.setattr(handlers.asyncio, "create_task", fail_if_started)
+
+    await handlers.cancel_callback(FakeUpdate(query), None)
+
+    assert started == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("callback", "data", "info"),
+    [
+        ("format_callback", "fmt:7:abcd:audio", {"title": "Video"}),
+        ("format_callback", "fmt:7:abcd:video", {"title": "Video", "formats": []}),
+        ("quality_callback", "qty:7:abcd:22", {"title": "Video"}),
+        (
+            "russian_quality_callback",
+            "ruqty:7:abcd:720",
+            {"title": "Video", "russian_audio": {"formats": [{"height": 720}]}},
+        ),
+    ],
+)
+async def test_final_selection_starts_one_download_and_consumes_session(
+    monkeypatch, callback, data, info
+):
+    calls = []
+    query = FakeQuery(data=data, chat_id=10, message_id=7)
+    handlers._state[handlers._state_key(10, 7, "abcd")] = {
+        "url": "https://youtu.be/x", "info": info, "created": time.time(), "user_id": 1,
+    }
+
+    async def fake_download(*args, **kwargs):
+        calls.append(kwargs)
+
+    monkeypatch.setattr(handlers, "download_and_send", fake_download)
+
+    handler = getattr(handlers, callback)
+    await handler(FakeUpdate(query), None)
+    await handler(FakeUpdate(query), None)
+    await asyncio.sleep(0)
+
+    assert len(calls) == 1
+    assert handlers._state == {}
 
 
 @pytest.mark.asyncio
@@ -280,7 +372,7 @@ async def test_russian_download_forwards_height_and_reports_selected_quality(mon
     }]
 
 
-def test_register_handlers_registers_russian_quality_callback():
+def test_register_handlers_registers_selection_callbacks():
     registered = []
 
     class Application:
@@ -289,11 +381,14 @@ def test_register_handlers_registers_russian_quality_callback():
 
     handlers.register_handlers(Application())
 
-    ruqty_handlers = [
+    callbacks = [
         handler for handler in registered
         if isinstance(handler, handlers.CallbackQueryHandler)
-        and handler.pattern.pattern == "^ruqty:"
     ]
 
-    assert len(ruqty_handlers) == 1
-    assert ruqty_handlers[0].callback == handlers.russian_quality_callback
+    assert {(handler.pattern.pattern, handler.callback) for handler in callbacks} == {
+        ("^fmt:", handlers.format_callback),
+        ("^qty:", handlers.quality_callback),
+        ("^ruqty:", handlers.russian_quality_callback),
+        ("^cancel:", handlers.cancel_callback),
+    }

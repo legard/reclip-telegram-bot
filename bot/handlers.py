@@ -134,8 +134,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/settings \\- View your preferences\n\n"
         "*Other:*\n"
         "/platforms \\- Supported sites\n"
-        "/stats \\- Bot stats\n"
-        "/cancel \\- Cancel \\(coming soon\\)\n\n"
+        "/stats \\- Bot stats\n\n"
         "You can also send multiple links in a single message\\!"
     )
     await update.message.reply_text(text, parse_mode="MarkdownV2")
@@ -393,7 +392,9 @@ def _build_format_buttons(
             InlineKeyboardButton("MP4 • RU", callback_data=f"fmt:{message_id}:{url_hash}:video_ru")
         )
     buttons.append(InlineKeyboardButton("MP3", callback_data=f"fmt:{message_id}:{url_hash}:audio"))
-    return InlineKeyboardMarkup([buttons])
+    return InlineKeyboardMarkup([buttons, [
+        InlineKeyboardButton("Cancel", callback_data=f"cancel:{message_id}:{url_hash}")
+    ]])
 
 
 def _build_quality_buttons(message_id: int, url_hash: str, formats: list[dict]) -> InlineKeyboardMarkup:
@@ -405,6 +406,7 @@ def _build_quality_buttons(message_id: int, url_hash: str, formats: list[dict]) 
         )
     rows = [buttons[i : i + 3] for i in range(0, len(buttons), 3)]
     rows.append([InlineKeyboardButton("Best quality", callback_data=f"qty:{message_id}:{url_hash}:best")])
+    rows.append([InlineKeyboardButton("Cancel", callback_data=f"cancel:{message_id}:{url_hash}")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -422,6 +424,7 @@ def _build_russian_quality_buttons(
     rows.append([
         InlineKeyboardButton("Best quality", callback_data=f"ruqty:{message_id}:{url_hash}:best")
     ])
+    rows.append([InlineKeyboardButton("Cancel", callback_data=f"cancel:{message_id}:{url_hash}")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -539,12 +542,14 @@ async def format_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if fmt == "audio":
+        _state.pop(key, None)
         asyncio.create_task(
             download_and_send(query, entry, format="audio", format_id=None)
         )
     elif fmt == "video":
         formats = entry["info"].get("formats", [])
         if not formats:
+            _state.pop(key, None)
             asyncio.create_task(
                 download_and_send(query, entry, format="video", format_id=None)
             )
@@ -584,6 +589,7 @@ async def quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     fid = None if format_id == "best" else format_id
+    _state.pop(key, None)
     asyncio.create_task(
         download_and_send(query, entry, format="video", format_id=fid)
     )
@@ -620,6 +626,7 @@ async def russian_quality_callback(update: Update, context: ContextTypes.DEFAULT
         await query.edit_message_text("Session expired. Please send the link again.")
         return
 
+    _state.pop(key, None)
     asyncio.create_task(
         download_and_send(
             query,
@@ -630,6 +637,27 @@ async def russian_quality_callback(update: Update, context: ContextTypes.DEFAULT
             height=height,
         )
     )
+
+
+async def cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _evict_stale()
+    query = update.callback_query
+    await query.answer()
+
+    parts = query.data.split(":")
+    if len(parts) != 3 or not parts[1].isdecimal():
+        return
+    _, msg_id_str, uhash = parts
+    key = _state_key(query.message.chat_id, int(msg_id_str), uhash)
+    if key not in _state:
+        key = _state_key(query.message.chat_id, query.message.message_id, uhash)
+    if _state.pop(key, None) is None:
+        return
+
+    if query.message.photo:
+        await query.edit_message_caption(caption="Cancelled.", reply_markup=None)
+    else:
+        await query.edit_message_text("Cancelled.", reply_markup=None)
 
 
 async def download_and_send(
@@ -781,3 +809,4 @@ def register_handlers(application):
     application.add_handler(CallbackQueryHandler(format_callback, pattern=r"^fmt:"))
     application.add_handler(CallbackQueryHandler(quality_callback, pattern=r"^qty:"))
     application.add_handler(CallbackQueryHandler(russian_quality_callback, pattern=r"^ruqty:"))
+    application.add_handler(CallbackQueryHandler(cancel_callback, pattern=r"^cancel:"))
