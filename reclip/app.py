@@ -309,6 +309,9 @@ def _probe_job_info(job, url):
 def _russian_audio_is_confirmed_unavailable(info, height):
     if not isinstance(info, dict):
         return False
+    formats = info.get("formats")
+    if not isinstance(formats, list) or not all(isinstance(fmt, dict) for fmt in formats):
+        return False
     try:
         return not russian_download_available(info, height)
     except (AttributeError, TypeError):
