@@ -4,9 +4,9 @@
 
 **Goal:** Добавить в Telegram-бот условную кнопку `MP4 • RU`, которая скачивает YouTube-видео с отдельной русской дорожкой в выбранном разрешении без fallback на исходный звук.
 
-**Architecture:** ReClip выполняет обычный probe для существующего контракта и отдельный локализованный YouTube probe для обнаружения русской дорожки; чистые правила языка, разрешений и yt-dlp selector изолируются в `reclip/youtube_audio.py`. Telegram-бот передаёт в расширенный `/api/download` только `audio_language="ru"` и высоту, а ReClip повторно проверяет свежие метаданные внутри общего job deadline перед запуском языково-ограниченного selector. Deno и EJS входят в multi-arch образ ReClip, а выпуск заканчивается immutable digest rollout через отдельный Ansible-worktree и Telegram smoke-тест.
+**Architecture:** ReClip выполняет обычный probe для существующего контракта и отдельный локализованный `mweb` probe через внутренний BGUtil PO-token provider для обнаружения русской дорожки; чистые правила языка, разрешений и yt-dlp selector изолируются в `reclip/youtube_audio.py`. Telegram-бот передаёт в расширенный `/api/download` только `audio_language="ru"` и высоту, а ReClip повторно проверяет свежие метаданные внутри общего job deadline перед запуском языково-ограниченного selector. Deno, EJS и matching BGUtil plugin входят в multi-arch образ ReClip, BGUtil работает отдельным internal-only sidecar, а выпуск заканчивается immutable digest rollout через отдельный Ansible-worktree и Telegram smoke-тест.
 
-**Tech Stack:** Python 3.12, Flask, yt-dlp 2026.x with `yt-dlp[default]`, Deno 2.9.4, pytest, python-telegram-bot, httpx, Docker Buildx, GitHub Actions, Ansible.
+**Tech Stack:** Python 3.12, Flask, yt-dlp 2026.x with `yt-dlp[default]`, Deno 2.9.4, BGUtil provider/plugin 1.3.1, pytest, python-telegram-bot, httpx, Docker Buildx, GitHub Actions, Ansible.
 
 ## Global Constraints
 
@@ -16,7 +16,8 @@
 - Callback и API оперируют высотой, а не нестабильным YouTube format ID; `Best quality` передаёт `height=None`.
 - Обычные MP4 и MP3 сценарии, веб-интерфейс ReClip, semaphore, единый `JOB_TIMEOUT`, постобработка, очистка и локальный Telegram Bot API сохраняют текущее поведение.
 - Русский selector не содержит общей ветки `best`/`bestaudio` без фильтра `language=ru`; исчезнувшая дорожка завершает job точной ошибкой `Russian audio track is no longer available. Please retry.`.
-- Не добавлять cookies, Visitor Data, PO Token, удалённую загрузку EJS или секреты без отдельного согласования пользователя.
+- Пользователь разрешил автоматический self-hosted PO Token: использовать только pinned BGUtil provider/plugin `1.3.1`, без личных browser cookies, Visitor Data, hard-coded tokens, remote EJS или committed secrets.
+- BGUtil доступен только во внутренней Docker network как `http://bgutil:4416`; source Compose использует tag `brainicism/bgutil-ytdlp-pot-provider:1.3.1`, а Ansible закрепляет manifest index `sha256:1aaa43a0ca72dfca6a6d2129a0fb4a23465c25adb1b043f8aff829a20825646b`.
 - EJS поставляется внутри образа через `yt-dlp[default]`; Deno находится в `PATH`, поддерживает `linux/amd64` и `linux/arm64` и имеет версию не ниже официального минимума 2.3.0.
 - Следовать TDD: сначала наблюдаемое падение нового теста, затем минимальная реализация, затем узкий и полный test run.
 - Release version для этой функции — `v0.1.6`: remote tag `v0.1.5` уже указывает на `d827367`.
@@ -30,15 +31,17 @@
 - Modify `reclip/tests/test_app.py` — Flask API и job orchestration tests при сохранении существующих deadline/process tests.
 - Modify `reclip/Dockerfile` — multi-stage Deno binary и установка `requirements.txt`.
 - Modify `reclip/requirements.txt` — `yt-dlp[default]` вместо минимального `yt-dlp`.
+- Modify `docker-compose.yml` — internal-only `bgutil` sidecar, provider URL и dependency ReClip.
+- Modify `AGENTS.md` — пятый Docker service и локальный provider contract.
 - Modify `bot/reclip_client.py` — необязательные `audio_language` и `height` в download payload.
 - Modify `bot/tests/test_reclip_client.py` — точные payload tests для legacy и RU запросов.
 - Modify `bot/handlers.py` — условная кнопка, отдельные RU callbacks по высоте и проброс языка/высоты до клиента.
 - Modify `bot/tests/test_handlers.py` — keyboard, callback и download propagation tests.
 - Modify `.github/workflows/release.yml` — build/run runtime-contract image до release job.
 - Modify `.github/tests/test_ci_config.py` — проверка обязательных runtime-contract CI steps.
-- Modify `README.md` — пользовательский поток `MP4 • RU` и локальная зависимость Deno.
-- During rollout, modify `/Users/tabolin/projects/orangepi-ansible/group_vars/all/docker_services.yml` — три новых immutable manifest digest.
-- During rollout, modify `/Users/tabolin/projects/orangepi-ansible/tests/check_reclip_inventory.sh` — exact digest expectations.
+- Modify `README.md` — пользовательский поток `MP4 • RU`, Deno и BGUtil sidecar.
+- During rollout, modify `/Users/tabolin/projects/orangepi-ansible/group_vars/all/docker_services.yml` — три новых application digest и pinned BGUtil digest.
+- During rollout, modify `/Users/tabolin/projects/orangepi-ansible/tests/check_reclip_inventory.sh`, `tests/check_reclip_role_contract.sh`, `roles/docker_services/templates/reclip-compose.yml.j2`, `roles/docker_services/tasks/reclip_validate.yml`, and `roles/docker_services/tasks/reclip_health.yml` — provider pin, render и five-service health contract.
 - During rollout, modify `/Users/tabolin/projects/orangepi-ansible/docs/runbooks/reclip-orangepi.md` — `v0.1.6` и RU smoke acceptance.
 
 ---
@@ -47,11 +50,11 @@
 
 **Files:**
 - Modify: `reclip/Dockerfile:1-16`
-- Modify: `reclip/requirements.txt:1-2`
+- Modify: `reclip/requirements.txt:1-3`
 
 **Interfaces:**
 - Consumes: official [yt-dlp EJS setup](https://github.com/yt-dlp/yt-dlp/wiki/EJS) and [Deno Docker binary image](https://github.com/denoland/deno_docker#using-your-own-base-image).
-- Produces: `deno` in `/usr/local/bin`, bundled `yt-dlp-ejs`, and a verified baseline extractor argument `youtube:lang=ru` for all later ReClip probes.
+- Produces: `deno` in `/usr/local/bin`, bundled `yt-dlp-ejs`, pinned `bgutil-ytdlp-pot-provider==1.3.1`, and a verified provider interface for later ReClip probes.
 
 - [ ] **Step 1: Build the baseline image and observe the missing runtime contracts**
 
@@ -97,6 +100,7 @@ Replace `reclip/requirements.txt` with:
 ```text
 flask
 yt-dlp[default]
+bgutil-ytdlp-pot-provider==1.3.1
 ```
 
 - [ ] **Step 3: Build the exact candidate image and verify runtime/EJS without network-time component downloads**
@@ -105,17 +109,22 @@ yt-dlp[default]
 docker build -t reclip-russian-audio-feasibility ./reclip
 docker run --rm reclip-russian-audio-feasibility deno --version
 docker run --rm reclip-russian-audio-feasibility \
-  python -c 'from importlib.metadata import version; print(version("yt-dlp")); print(version("yt-dlp-ejs"))'
+  python -c 'from importlib.metadata import version; print(version("yt-dlp")); print(version("yt-dlp-ejs")); print(version("bgutil-ytdlp-pot-provider"))'
 ```
 
-Expected: image builds; Deno reports `2.9.4`; both Python distributions print installed versions. Do not add `--remote-components` because EJS must already be in the image.
+Expected: image builds; Deno reports `2.9.4`; yt-dlp, EJS and BGUtil plugin report installed versions. Do not add `--remote-components` because EJS must already be in the image.
 
 - [ ] **Step 4: Run the localized extraction three times inside the candidate image**
 
 ```bash
+docker network create reclip-russian-audio-feasibility
+docker run -d --name bgutil --network reclip-russian-audio-feasibility \
+  brainicism/bgutil-ytdlp-pot-provider:1.3.1
 for attempt in 1 2 3; do
-  docker run --rm reclip-russian-audio-feasibility \
-    yt-dlp --no-playlist -J --extractor-args 'youtube:lang=ru' \
+  docker run --rm --network reclip-russian-audio-feasibility \
+    reclip-russian-audio-feasibility yt-dlp --no-playlist -J \
+    --extractor-args 'youtube:lang=ru;player_client=mweb' \
+    --extractor-args 'youtubepot-bgutilhttp:base_url=http://bgutil:4416' \
     'https://www.youtube.com/watch?v=M6mYodf0dJM' |
   python -c '
 import json, sys
@@ -126,13 +135,15 @@ assert any(f.get("acodec") not in (None, "none") for f in ru), "no Russian audio
 print(sorted({f.get("height") for f in ru if f.get("height")}, reverse=True))
 '
 done
+docker rm -f bgutil
+docker network rm reclip-russian-audio-feasibility
 ```
 
-Expected: all three pipelines exit 0 and print at least one Russian-audio height or confirm an audio-only Russian format. Warnings about SABR/PO Token do not change the baseline while the required formats remain available.
+Expected: all three pipelines exit 0 and confirm Russian audio. The provider POC must not use browser cookies, Visitor Data or literal tokens.
 
 - [ ] **Step 5: Enforce the feasibility decision gate**
 
-If any attempt cannot expose Russian audio with Deno + bundled EJS + `youtube:lang=ru`, stop implementation and preserve the command output. Do not add cookies, Visitor Data, PO Token, `mweb`, or remote EJS; report the failed gate for explicit user direction. If all attempts pass, later code uses only `youtube:lang=ru`; Deno remains enabled by yt-dlp's default runtime policy, so no redundant `--js-runtimes` flag is added.
+The original anonymous `youtube:lang=ru` gate failed because the `web_safari` HLS manifest was intermittent. The user-approved GREEN gate is three successful provider-backed `mweb` attempts with the two extractor arguments above. Deno remains enabled by yt-dlp's default runtime policy, so no redundant `--js-runtimes` flag is added.
 
 - [ ] **Step 6: Commit the runtime contract**
 
@@ -151,7 +162,7 @@ git commit -m "Добавить runtime для русских дорожек You
 
 **Interfaces:**
 - Consumes: normal and localized yt-dlp info dictionaries.
-- Produces: `RUSSIAN_EXTRACTOR_ARGS: str`, `empty_russian_audio() -> dict`, `is_youtube_info(info) -> bool`, `is_youtube_url(url) -> bool`, `russian_audio_summary(default_info, localized_info) -> dict`, `russian_download_available(localized_info, height) -> bool`, and `build_russian_format_selector(height) -> str`.
+- Produces: `build_russian_extractor_args(provider_url) -> list[str]`, `empty_russian_audio() -> dict`, `is_youtube_info(info) -> bool`, `is_youtube_url(url) -> bool`, `russian_audio_summary(default_info, localized_info) -> dict`, `russian_download_available(localized_info, height) -> bool`, and `build_russian_format_selector(height) -> str`.
 
 - [ ] **Step 1: Write failing discovery tests with representative format metadata**
 
@@ -159,6 +170,7 @@ git commit -m "Добавить runtime для русских дорожек You
 import pytest
 
 from reclip.youtube_audio import (
+    build_russian_extractor_args,
     build_russian_format_selector,
     is_youtube_url,
     russian_audio_summary,
@@ -234,6 +246,13 @@ def test_selector_has_language_filter_in_every_branch_and_never_falls_back():
     assert not selector.endswith("/best")
 
 
+def test_russian_extractor_args_use_mweb_and_internal_provider():
+    assert build_russian_extractor_args("http://bgutil:4416/") == [
+        "youtube:lang=ru;player_client=mweb",
+        "youtubepot-bgutilhttp:base_url=http://bgutil:4416",
+    ]
+
+
 @pytest.mark.parametrize("url", ["https://youtube.com/watch?v=x", "https://www.youtube.com/shorts/x", "https://youtu.be/x"])
 def test_youtube_url_hosts_are_accepted(url):
     assert is_youtube_url(url) is True
@@ -256,13 +275,19 @@ import re
 from urllib.parse import urlparse
 
 
-RUSSIAN_EXTRACTOR_ARGS = "youtube:lang=ru"
 RUSSIAN_LANGUAGE = re.compile(r"^ru(?:-|$)", re.IGNORECASE)
 RUSSIAN_FILTER = "[language~='^ru(?:-|$)']"
 
 
 def empty_russian_audio():
     return {"available": False, "formats": []}
+
+
+def build_russian_extractor_args(provider_url):
+    return [
+        "youtube:lang=ru;player_client=mweb",
+        f"youtubepot-bgutilhttp:base_url={provider_url.rstrip('/')}",
+    ]
 
 
 def _has_audio(fmt):
@@ -371,7 +396,7 @@ git commit -m "Описать выбор русской аудиодорожки
 - Modify: `reclip/tests/test_app.py`
 
 **Interfaces:**
-- Consumes: `is_youtube_info`, `RUSSIAN_EXTRACTOR_ARGS`, `russian_audio_summary`, and `empty_russian_audio` from Task 2.
+- Consumes: `is_youtube_info`, `build_russian_extractor_args`, `russian_audio_summary`, and `empty_russian_audio` from Task 2.
 - Produces: `build_info_command(url, russian=False) -> list[str]`, `fetch_info(url, russian=False, timeout=60) -> dict`, and an always-present `/api/info.russian_audio` object.
 
 - [ ] **Step 1: Write failing Flask API tests for discovery and graceful degradation**
@@ -437,7 +462,8 @@ Expected: FAIL because `fetch_info` and `russian_audio` do not exist.
 def build_info_command(url, *, russian=False):
     command = ["yt-dlp", "--no-playlist", "-J"]
     if russian:
-        command += ["--extractor-args", RUSSIAN_EXTRACTOR_ARGS]
+        for extractor_arg in build_russian_extractor_args(POT_PROVIDER_URL):
+            command += ["--extractor-args", extractor_arg]
     command.append(url)
     return command
 
@@ -455,7 +481,7 @@ def fetch_info(url, *, russian=False, timeout=60):
     return json.loads(result.stdout)
 ```
 
-Import Task 2 helpers at the top of `app.py` and replace the inline normal probe in `get_info()` with `fetch_info(url)`. Initialize `russian_audio = empty_russian_audio()`, run `fetch_info(url, russian=True)` only when `is_youtube_info(info)`, catch that second probe separately, log with `logger.warning("localized Russian probe failed url=%s: %s", url, error)`, and include `"russian_audio": russian_audio` in every successful JSON response.
+Import Task 2 helpers and define `POT_PROVIDER_URL = os.environ.get("POT_PROVIDER_URL", "http://bgutil:4416")` at the top of `app.py`. Replace the inline normal probe in `get_info()` with `fetch_info(url)`. Initialize `russian_audio = empty_russian_audio()`, run `fetch_info(url, russian=True)` only when `is_youtube_info(info)`, catch that second probe separately, log with `logger.warning("localized Russian probe failed url=%s: %s", url, error)`, and include `"russian_audio": russian_audio` in every successful JSON response.
 
 - [ ] **Step 4: Run focused and complete ReClip tests**
 
@@ -483,7 +509,7 @@ git commit -m "Обнаруживать русскую дорожку в ReClip 
 - Modify: `reclip/tests/test_app.py`
 
 **Interfaces:**
-- Consumes: `is_youtube_url`, `RUSSIAN_EXTRACTOR_ARGS`, `russian_download_available`, and `build_russian_format_selector` from Task 2.
+- Consumes: `is_youtube_url`, `build_russian_extractor_args`, `russian_download_available`, and `build_russian_format_selector` from Task 2.
 - Produces: extended `build_download_command(..., audio_language=None, height=None)`, `run_download(..., audio_language=None, height=None)`, `_do_download(..., audio_language=None, height=None)`, and `/api/download` validation for `audio_language`/`height`.
 
 - [ ] **Step 1: Write failing command tests proving RU language filters and legacy stability**
@@ -495,7 +521,11 @@ def test_russian_download_command_uses_localized_selector_without_fallback():
         audio_language="ru", height=720,
     )
     selector = command[command.index("-f") + 1]
-    assert command[command.index("--extractor-args") + 1] == "youtube:lang=ru"
+    extractor_args = [command[index + 1] for index, value in enumerate(command) if value == "--extractor-args"]
+    assert extractor_args == [
+        "youtube:lang=ru;player_client=mweb",
+        "youtubepot-bgutilhttp:base_url=http://bgutil:4416",
+    ]
     assert all("language~=" in branch for branch in selector.split("/"))
     assert all("height=720" in branch for branch in selector.split("/"))
     assert "bestaudio" not in selector
@@ -571,11 +601,9 @@ def build_download_command(job_id, url, format_choice, format_id, audio_language
     if format_choice == "audio":
         command += ["-x", "--audio-format", "mp3"]
     elif audio_language == "ru":
-        command += [
-            "--extractor-args", RUSSIAN_EXTRACTOR_ARGS,
-            "-f", build_russian_format_selector(height),
-            "--merge-output-format", "mp4",
-        ]
+        for extractor_arg in build_russian_extractor_args(POT_PROVIDER_URL):
+            command += ["--extractor-args", extractor_arg]
+        command += ["-f", build_russian_format_selector(height), "--merge-output-format", "mp4"]
     elif format_id:
         command += ["-f", f"{format_id}+bestaudio/best", "--merge-output-format", "mp4"]
     else:
@@ -932,6 +960,8 @@ git commit -m "Добавить выбор русской дорожки в Tele
 **Files:**
 - Modify: `.github/workflows/release.yml:25-40`
 - Modify: `.github/tests/test_ci_config.py:147-177`
+- Modify: `docker-compose.yml:1-20`
+- Modify: `AGENTS.md:7-16,27-43`
 - Modify: `README.md:10-15,145-153,153-166`
 
 **Interfaces:**
@@ -947,13 +977,23 @@ def test_release_builds_and_executes_reclip_runtime_contract_image():
     assert "docker build -t reclip-runtime-contract ./reclip" in commands
     assert "docker run --rm reclip-runtime-contract deno --version" in commands
     assert 'version("yt-dlp-ejs")' in commands
+
+
+def test_compose_wires_internal_bgutil_provider_to_reclip():
+    compose = load_yaml(COMPOSE_PATH)
+    bgutil = compose["services"]["bgutil"]
+    reclip = compose["services"]["reclip"]
+    assert bgutil["image"] == "brainicism/bgutil-ytdlp-pot-provider:1.3.1"
+    assert "ports" not in bgutil
+    assert "bgutil" in reclip["depends_on"]
+    assert "POT_PROVIDER_URL=http://bgutil:4416" in reclip["environment"]
 ```
 
 - [ ] **Step 2: Run the CI config test and observe failure**
 
 Run: `python -m pytest .github/tests/test_ci_config.py -k runtime_contract -v`
 
-Expected: FAIL because workflow does not build or inspect the ReClip runtime image.
+Expected: FAIL because workflow does not build/inspect the runtime image and Compose has no BGUtil service.
 
 - [ ] **Step 3: Add native runtime image verification to the test job**
 
@@ -969,11 +1009,11 @@ Add after `Run ReClip tests` in `.github/workflows/release.yml`:
           docker run --rm reclip-runtime-contract python -c 'from importlib.metadata import version; print(version("yt-dlp-ejs"))'
 ```
 
-The existing release Buildx step remains responsible for `linux/amd64,linux/arm64`; do not duplicate remote YouTube extraction in CI because it is an unstable third-party network dependency.
+Add `bgutil` to source Compose with image `brainicism/bgutil-ytdlp-pot-provider:1.3.1`, only the existing `internal` network, `restart: unless-stopped`, and no host ports. Add `POT_PROVIDER_URL=http://bgutil:4416` plus `depends_on: [bgutil]` to ReClip. The existing release Buildx step remains responsible for application `linux/amd64,linux/arm64`; BGUtil is an external multi-arch image and must not enter the application build matrix. Do not duplicate remote YouTube extraction in CI because it is an unstable third-party network dependency.
 
 - [ ] **Step 4: Update README with exact user and local-runtime behavior**
 
-Add `MP4 • RU` to the feature list and download flow: it appears only when a separate Russian YouTube track is detected, opens Russian resolutions plus `Best quality`, and never substitutes original audio. In local ReClip prerequisites state: Deno >= 2.3.0 must be in `PATH`, and `pip install -r reclip/requirements.txt` installs bundled EJS through `yt-dlp[default]`. Keep ordinary MP4/MP3 instructions unchanged.
+Add `MP4 • RU` to the feature list and download flow: it appears only when a separate Russian YouTube track is detected, opens Russian resolutions plus `Best quality`, and never substitutes original audio. Document BGUtil as the fifth internal-only service. In local ReClip prerequisites state: Deno >= 2.3.0 must be in `PATH`, `pip install -r reclip/requirements.txt` installs bundled EJS/plugin, and a BGUtil 1.3.1 endpoint must be reachable at `POT_PROVIDER_URL`. Update `AGENTS.md` with the same five-service/runtime contract. Keep ordinary MP4/MP3 instructions unchanged.
 
 - [ ] **Step 5: Run every repository test suite from the repository root**
 
@@ -999,7 +1039,10 @@ Start the image with a temporary downloads directory and expose port 18899:
 
 ```bash
 reclip_smoke_dir=$(mktemp -d)
-docker run -d --name reclip-russian-audio-smoke \
+docker network create reclip-russian-audio-smoke
+docker run -d --name bgutil --network reclip-russian-audio-smoke \
+  brainicism/bgutil-ytdlp-pot-provider:1.3.1
+docker run -d --name reclip-russian-audio-smoke --network reclip-russian-audio-smoke \
   -p 127.0.0.1:18899:8899 \
   -v "$reclip_smoke_dir:/downloads" \
   reclip-russian-audio-final
@@ -1017,6 +1060,8 @@ assert heights == sorted(set(heights), reverse=True)
 print(heights)
 '
 docker rm -f reclip-russian-audio-smoke
+docker rm -f bgutil
+docker network rm reclip-russian-audio-smoke
 ```
 
 Expected: API assertion passes. Remove only the explicitly named smoke container; retain the temporary directory path until its contents have been inspected.
@@ -1024,7 +1069,7 @@ Expected: API assertion passes. Remove only the explicitly named smoke container
 - [ ] **Step 7: Commit CI and documentation**
 
 ```bash
-git add .github/workflows/release.yml .github/tests/test_ci_config.py README.md
+git add .github/workflows/release.yml .github/tests/test_ci_config.py docker-compose.yml AGENTS.md README.md
 git commit -m "Проверять русский YouTube runtime в CI"
 ```
 
@@ -1035,11 +1080,15 @@ git commit -m "Проверять русский YouTube runtime в CI"
 **Files:**
 - Modify in isolated Ansible worktree: `group_vars/all/docker_services.yml:114-118`
 - Modify in isolated Ansible worktree: `tests/check_reclip_inventory.sh:26-42`
+- Modify in isolated Ansible worktree: `tests/check_reclip_role_contract.sh`
+- Modify in isolated Ansible worktree: `roles/docker_services/templates/reclip-compose.yml.j2`
+- Modify in isolated Ansible worktree: `roles/docker_services/tasks/reclip_validate.yml`
+- Modify in isolated Ansible worktree: `roles/docker_services/tasks/reclip_health.yml`
 - Modify in isolated Ansible worktree: `docs/runbooks/reclip-orangepi.md:8-27,67-82`
 
 **Interfaces:**
 - Consumes: merged/pushed ReClip commit with all CI checks green and GHCR version `0.1.6` manifest indexes.
-- Produces: Orange Pi running exact new digests and an accepted Telegram MP4 with Russian speech.
+- Produces: Orange Pi running three exact application digests plus the exact BGUtil provider digest and an accepted Telegram MP4 with Russian speech.
 
 - [ ] **Step 1: Run the pre-release verification skill and confirm a clean ReClip branch**
 
@@ -1092,7 +1141,7 @@ Do not edit the dirty primary checkout and do not recreate from stale `origin/ma
 
 - [ ] **Step 6: Make the Ansible digest test fail with the released values**
 
-In the isolated worktree, use `apply_patch` to replace the three old expected `reclip`, `bot`, and `dashboard` digests in `tests/check_reclip_inventory.sh` with the exact top-level digests recorded in Step 4. Leave `telegram-bot-api` unchanged.
+In the isolated worktree, use `apply_patch` to replace the three old expected `reclip`, `bot`, and `dashboard` digests in `tests/check_reclip_inventory.sh` with the exact top-level digests recorded in Step 4. Add the exact BGUtil reference `docker.io/brainicism/bgutil-ytdlp-pot-provider@sha256:1aaa43a0ca72dfca6a6d2129a0fb4a23465c25adb1b043f8aff829a20825646b`; leave `telegram-bot-api` unchanged.
 
 Run: `bash tests/check_reclip_inventory.sh`
 
@@ -1108,6 +1157,8 @@ Use `apply_patch` to map each Step 4 digest to the matching variable:
 
 Keep the three full references under their exact package names (`reclip`, `bot`, `dashboard`) and append the matching 64-character lowercase hexadecimal digest printed in Step 4 after `@sha256:`. In `docs/runbooks/reclip-orangepi.md`, change the release prerequisite to `v0.1.6` and add the test URL plus acceptance: `MP4 • RU` visible, selected quality delivered as playable MP4, Russian speech audible, and temporary file removed after successful upload.
 
+Add `docker_services_reclip_bgutil_image` with the exact digest above. Render an internal-only `bgutil` service in `reclip-compose.yml.j2`, pass `POT_PROVIDER_URL: http://bgutil:4416` to ReClip, and make ReClip depend on it. Extend `reclip_validate.yml` with the exact immutable reference, `reclip_health.yml` expected running-service lists from four to five services, and `tests/check_reclip_role_contract.sh` assertions for the provider image, no host ports, provider URL and five-service health contract.
+
 - [ ] **Step 8: Verify and commit only the Ansible rollout files**
 
 ```bash
@@ -1115,8 +1166,8 @@ bash tests/check_reclip_inventory.sh
 bash tests/check_reclip_role_contract.sh
 git diff --check
 git status --short
-git diff -- group_vars/all/docker_services.yml tests/check_reclip_inventory.sh docs/runbooks/reclip-orangepi.md
-git add group_vars/all/docker_services.yml tests/check_reclip_inventory.sh docs/runbooks/reclip-orangepi.md
+git diff -- group_vars/all/docker_services.yml tests/check_reclip_inventory.sh tests/check_reclip_role_contract.sh roles/docker_services/templates/reclip-compose.yml.j2 roles/docker_services/tasks/reclip_validate.yml roles/docker_services/tasks/reclip_health.yml docs/runbooks/reclip-orangepi.md
+git add group_vars/all/docker_services.yml tests/check_reclip_inventory.sh tests/check_reclip_role_contract.sh roles/docker_services/templates/reclip-compose.yml.j2 roles/docker_services/tasks/reclip_validate.yml roles/docker_services/tasks/reclip_health.yml docs/runbooks/reclip-orangepi.md
 git commit -m "Выпустить русскую дорожку ReClip"
 ```
 
@@ -1124,7 +1175,7 @@ Expected: both shell contracts pass; the diff contains only the three synchroniz
 
 - [ ] **Step 9: Pre-pull exact arm64 images before changing the running stack**
 
-For the four exact references now present in Ansible (three updated ReClip images plus unchanged Telegram Bot API), run the runbook preflight on `orangepi`: inspect for `linux/arm64` and pull every exact digest. If any inspect/pull fails, do not run the playbook and do not stop the existing stack.
+For the five exact references now present in Ansible (three updated ReClip images, pinned BGUtil, and unchanged Telegram Bot API), run the runbook preflight on `orangepi`: inspect for `linux/arm64` and pull every exact digest. If any inspect/pull fails, do not run the playbook and do not stop the existing stack.
 
 - [ ] **Step 10: Deploy the pinned stack**
 
@@ -1136,7 +1187,7 @@ ansible-playbook playbooks/main.yml --limit orangepi --tags reclip \
   --vault-password-file /Users/tabolin/projects/orangepi-ansible/.vault_pass
 ```
 
-Expected: `failed=0`; ReClip role validates immutable references, renders Compose, starts four services, and passes its API, Telegram, dashboard, polling, and listener health checks.
+Expected: `failed=0`; ReClip role validates immutable references, renders Compose, starts five services, and passes its API, Telegram, dashboard, polling, provider, and listener health checks.
 
 - [ ] **Step 11: Verify deployed digests and perform the Telegram acceptance test**
 
@@ -1145,8 +1196,8 @@ ssh orangepi 'cd /opt/docker/services/reclip && sudo docker compose -p reclip ps
 ssh orangepi 'cd /opt/docker/services/reclip && sudo docker compose -p reclip images'
 ```
 
-Expected: all four services running; the three application container image IDs match the pinned manifest/platform resolution. Send `https://www.youtube.com/watch?v=M6mYodf0dJM` to the real bot, select `MP4 • RU`, choose a concrete height, and confirm the delivered MP4 is playable with Russian speech. Repeat with `Best quality`; confirm ordinary MP4 and MP3 still work and the successful uploads leave no corresponding temporary files in `/opt/docker/services/reclip/downloads`.
+Expected: all five services running; the three application and BGUtil container image IDs match the pinned manifest/platform resolution. Send `https://www.youtube.com/watch?v=M6mYodf0dJM` to the real bot, select `MP4 • RU`, choose a concrete height, and confirm the delivered MP4 is playable with Russian speech. Repeat with `Best quality`; confirm ordinary MP4 and MP3 still work and the successful uploads leave no corresponding temporary files in `/opt/docker/services/reclip/downloads`.
 
 - [ ] **Step 12: Record final evidence before claiming completion**
 
-Capture: ReClip commit/release URL, successful release workflow run, three top-level digests, Ansible commit, play recap, `docker compose ps/images`, and both Telegram RU smoke results. Only after all evidence is present mark the feature complete; if extraction needs PO Token/cookies at this stage, report the blocked external dependency without enabling either mechanism.
+Capture: ReClip commit/release URL, successful release workflow run, three application top-level digests, pinned BGUtil digest, Ansible commit, play recap, `docker compose ps/images`, and both Telegram RU smoke results. Only after all evidence is present mark the feature complete; never introduce personal cookies or literal token values.
