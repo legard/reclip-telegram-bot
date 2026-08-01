@@ -105,6 +105,101 @@ def test_download_command_limits_fragment_concurrency():
     assert command[fragments_index + 1] == "2"
 
 
+def test_russian_download_command_uses_localized_selector_without_fallback():
+    command = app.build_download_command(
+        "job-1", "https://youtu.be/x", "video", None,
+        audio_language="ru", height=720,
+    )
+
+    selector = command[command.index("-f") + 1]
+    extractor_args = [
+        command[index + 1]
+        for index, value in enumerate(command)
+        if value == "--extractor-args"
+    ]
+
+    assert extractor_args == [
+        "youtube:lang=ru;player_client=mweb",
+        "youtubepot-bgutilhttp:base_url=http://bgutil:4416",
+    ]
+    assert all("language~=" in branch for branch in selector.split("/"))
+    assert all("height=720" in branch for branch in selector.split("/"))
+    assert "bestaudio" not in selector
+
+
+def test_legacy_best_video_command_is_unchanged():
+    command = app.build_download_command("job-1", "https://example.com/video", "video", None)
+
+    assert command[command.index("-f") + 1] == "bv*[vcodec~='^(avc|h264)']+ba/b[vcodec~='^(avc|h264)']/bv*+ba/b"
+    assert "--extractor-args" not in command
+
+
+@pytest.mark.parametrize("payload", [
+    {"url": "https://youtu.be/x", "audio_language": "de"},
+    {"url": "https://youtu.be/x", "audio_language": "ru", "height": 0},
+    {"url": "https://youtu.be/x", "audio_language": "ru", "height": -1},
+    {"url": "https://youtu.be/x", "audio_language": "ru", "height": "720"},
+    {"url": "https://youtu.be/x", "audio_language": "ru", "height": True},
+    {"url": "https://vimeo.com/1", "audio_language": "ru"},
+    {"url": "https://youtu.be/x", "format": "audio", "audio_language": "ru"},
+    {"url": "https://youtu.be/x", "audio_language": "ru", "format_id": "22"},
+])
+def test_download_rejects_invalid_russian_requests_before_thread(monkeypatch, payload):
+    started = []
+    monkeypatch.setattr(app.threading, "Thread", lambda *args, **kwargs: started.append((args, kwargs)))
+
+    response = app.app.test_client().post("/api/download", json=payload)
+
+    assert response.status_code == 400
+    assert started == []
+
+
+def test_download_starts_russian_job_with_height_not_format_id(monkeypatch):
+    captured = {}
+
+    class Thread:
+        daemon = False
+
+        def __init__(self, *, target, args):
+            captured.update(target=target, args=args)
+
+        def start(self):
+            captured["started"] = True
+
+    monkeypatch.setattr(app.threading, "Thread", Thread)
+
+    response = app.app.test_client().post("/api/download", json={
+        "url": "https://youtu.be/x", "format": "video", "title": "Video",
+        "audio_language": "ru", "height": 720,
+    })
+
+    try:
+        assert response.status_code == 200
+        assert captured["args"][4:] == ("ru", 720)
+        assert captured["started"] is True
+    finally:
+        app.jobs.pop(response.get_json()["job_id"], None)
+
+
+def test_russian_job_stops_before_download_when_track_disappears(monkeypatch):
+    job = app._new_job("job-1", "https://youtu.be/x", "Video")
+    app.jobs["job-1"] = job
+    monkeypatch.setattr(app, "_probe_job_info", lambda current_job, url: {"formats": []})
+    monkeypatch.setattr(
+        app,
+        "build_download_command",
+        lambda *args, **kwargs: pytest.fail("download command must not be built"),
+    )
+
+    try:
+        app._do_download("job-1", "https://youtu.be/x", "video", None, "ru", 720)
+    finally:
+        app.jobs.pop("job-1", None)
+
+    assert job["status"] == "error"
+    assert job["error"] == "Russian audio track is no longer available. Please retry."
+
+
 def test_ffmpeg_runner_discards_process_output(monkeypatch):
     captured = {}
 

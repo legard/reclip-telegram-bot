@@ -18,6 +18,9 @@ try:
         build_russian_extractor_args,
         empty_russian_audio,
         is_youtube_info,
+        is_youtube_url,
+        build_russian_format_selector,
+        russian_download_available,
         russian_audio_summary,
     )
 except ImportError:
@@ -25,6 +28,9 @@ except ImportError:
         build_russian_extractor_args,
         empty_russian_audio,
         is_youtube_info,
+        is_youtube_url,
+        build_russian_format_selector,
+        russian_download_available,
         russian_audio_summary,
     )
 
@@ -58,7 +64,7 @@ TOKEN_PATTERN = re.compile(
 )
 
 
-def build_download_command(job_id, url, format_choice, format_id):
+def build_download_command(job_id, url, format_choice, format_id, audio_language=None, height=None):
     out_template = os.path.join(DOWNLOAD_DIR, f"{job_id}.%(ext)s")
     command = [
         "yt-dlp", "--no-playlist", "-o", out_template,
@@ -74,6 +80,10 @@ def build_download_command(job_id, url, format_choice, format_id):
 
     if format_choice == "audio":
         command += ["-x", "--audio-format", "mp3"]
+    elif audio_language == "ru":
+        for extractor_arg in build_russian_extractor_args(POT_PROVIDER_URL):
+            command += ["--extractor-args", extractor_arg]
+        command += ["-f", build_russian_format_selector(height), "--merge-output-format", "mp4"]
     elif format_id:
         command += ["-f", f"{format_id}+bestaudio/best", "--merge-output-format", "mp4"]
     else:
@@ -281,7 +291,17 @@ def _run_job_process(job, command, *, capture_output=False):
         _clear_job_process(job, process)
 
 
-def run_download(job_id, url, format_choice, format_id):
+def _probe_job_info(job, url):
+    result = _run_job_process(job, build_info_command(url, russian=True), capture_output=True)
+    if result.returncode != 0:
+        return None
+    try:
+        return json.loads(result.stdout)
+    except (TypeError, json.JSONDecodeError):
+        return None
+
+
+def run_download(job_id, url, format_choice, format_id, audio_language=None, height=None):
     job = jobs[job_id]
 
     if not download_semaphore.acquire(timeout=30):
@@ -289,14 +309,13 @@ def run_download(job_id, url, format_choice, format_id):
         return
 
     try:
-        _do_download(job_id, url, format_choice, format_id)
+        _do_download(job_id, url, format_choice, format_id, audio_language, height)
     finally:
         download_semaphore.release()
 
 
-def _do_download(job_id, url, format_choice, format_id):
+def _do_download(job_id, url, format_choice, format_id, audio_language=None, height=None):
     job = jobs[job_id]
-    cmd = build_download_command(job_id, url, format_choice, format_id)
 
     remaining_timeout = max(0, job["_deadline_monotonic"] - time.monotonic())
     deadline_timer = threading.Timer(remaining_timeout, expire_job, args=(job,))
@@ -305,6 +324,14 @@ def _do_download(job_id, url, format_choice, format_id):
 
     stderr_lines = deque(maxlen=DOWNLOAD_DIAGNOSTIC_LINE_LIMIT)
     try:
+        if audio_language == "ru":
+            info = _probe_job_info(job, url)
+            if not russian_download_available(info or {}, height):
+                _finish_error(job, "Russian audio track is no longer available. Please retry.")
+                deadline_timer.cancel()
+                return
+
+        cmd = build_download_command(job_id, url, format_choice, format_id, audio_language, height)
         process = _start_job_process(
             job, cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
         )
@@ -443,6 +470,26 @@ def _do_download(job_id, url, format_choice, format_id):
         deadline_timer.cancel()
 
 
+def _new_job(job_id, url, title):
+    now = datetime.now(timezone.utc)
+    started_monotonic = time.monotonic()
+    deadline = now + timedelta(seconds=JOB_TIMEOUT)
+    return {
+        "job_id": job_id,
+        "status": "downloading",
+        "stage": "downloading",
+        "url": url,
+        "title": title,
+        "started_at": now.isoformat(),
+        "deadline_at": deadline.isoformat(),
+        "_started_monotonic": started_monotonic,
+        "_deadline_monotonic": started_monotonic + JOB_TIMEOUT,
+        "_timed_out": threading.Event(),
+        "_process_lock": threading.Lock(),
+        "_active_process": None,
+    }
+
+
 @app.route("/")
 def index():
     return render_template("index.html")
@@ -505,30 +552,32 @@ def start_download():
     format_choice = data.get("format", "video")
     format_id = data.get("format_id")
     title = data.get("title", "")
+    audio_language = data.get("audio_language")
+    height = data.get("height")
 
     if not url:
         return jsonify({"error": "No URL provided"}), 400
+    if audio_language not in (None, "ru"):
+        return jsonify({"error": "Unsupported audio_language"}), 400
+    if height is not None and (isinstance(height, bool) or not isinstance(height, int) or height <= 0):
+        return jsonify({"error": "height must be a positive integer"}), 400
+    if audio_language == "ru" and not is_youtube_url(url):
+        return jsonify({"error": "Russian audio is only supported for YouTube URLs"}), 400
+    if audio_language == "ru" and format_choice != "video":
+        return jsonify({"error": "Russian audio is only supported for video downloads"}), 400
+    if audio_language == "ru" and format_id is not None:
+        return jsonify({"error": "format_id is not accepted for Russian audio"}), 400
 
     job_id = uuid.uuid4().hex[:10]
-    now = datetime.now(timezone.utc)
-    deadline = now + timedelta(seconds=JOB_TIMEOUT)
-    jobs[job_id] = {
-        "job_id": job_id,
-        "status": "downloading",
-        "stage": "downloading",
-        "url": url,
-        "title": title,
-        "started_at": now.isoformat(),
-        "deadline_at": deadline.isoformat(),
-        "_started_monotonic": time.monotonic(),
-        "_deadline_monotonic": time.monotonic() + JOB_TIMEOUT,
-        "_timed_out": threading.Event(),
-        "_process_lock": threading.Lock(),
-        "_active_process": None,
-    }
+    jobs[job_id] = _new_job(job_id, url, title)
+    jobs[job_id]["_audio_language"] = audio_language
+    jobs[job_id]["_requested_height"] = height
     logger.info("job_id=%s stage=downloading", job_id)
 
-    thread = threading.Thread(target=run_download, args=(job_id, url, format_choice, format_id))
+    thread = threading.Thread(
+        target=run_download,
+        args=(job_id, url, format_choice, format_id, audio_language, height),
+    )
     thread.daemon = True
     thread.start()
 
