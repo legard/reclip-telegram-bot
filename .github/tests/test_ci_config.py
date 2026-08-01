@@ -175,3 +175,15 @@ def test_compose_passes_the_shared_job_deadline_to_reclip_and_bot():
     for service in ("reclip", "bot"):
         environment = compose["services"][service]["environment"]
         assert "JOB_TIMEOUT=${JOB_TIMEOUT:-${DOWNLOAD_TIMEOUT:-9000}}" in environment
+
+
+def test_compose_wires_reclip_to_internal_bgutil_provider():
+    compose = load_yaml(COMPOSE_PATH)
+    bgutil = compose["services"]["bgutil"]
+    reclip = compose["services"]["reclip"]
+
+    assert bgutil["image"] == "brainicism/bgutil-ytdlp-pot-provider:1.3.1"
+    assert "ports" not in bgutil
+    assert bgutil["networks"] == ["internal"]
+    assert "POT_PROVIDER_URL=http://bgutil:4416" in reclip["environment"]
+    assert "bgutil" in reclip["depends_on"]

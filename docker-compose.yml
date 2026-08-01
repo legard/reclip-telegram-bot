@@ -8,8 +8,17 @@ services:
       - MAX_CONCURRENT_DOWNLOADS=${MAX_CONCURRENT_DOWNLOADS:-3}
       - JOB_TIMEOUT=${JOB_TIMEOUT:-${DOWNLOAD_TIMEOUT:-9000}}
       - DOWNLOADS_PATH=/downloads
+      - POT_PROVIDER_URL=http://bgutil:4416
     volumes:
       - downloads:/downloads
+    depends_on:
+      - bgutil
+    networks:
+      - internal
+    restart: unless-stopped
+
+  bgutil:
+    image: brainicism/bgutil-ytdlp-pot-provider:1.3.1
     networks:
       - internal
     restart: unless-stopped
