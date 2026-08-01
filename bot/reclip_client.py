@@ -66,10 +66,22 @@ async def get_info(url: str) -> dict:
         raise ReclipInfoError(f"Info request failed: {e}")
 
 
-async def start_download(url: str, format: str, format_id: str | None, title: str) -> str:
+async def start_download(
+    url: str,
+    format: str,
+    format_id: str | None,
+    title: str,
+    *,
+    audio_language: str | None = None,
+    height: int | None = None,
+) -> str:
     payload = {"url": url, "format": format, "title": title}
     if format_id:
         payload["format_id"] = format_id
+    if audio_language is not None:
+        payload["audio_language"] = audio_language
+    if height is not None:
+        payload["height"] = height
     try:
         async with _client() as client:
             resp = await client.post("/api/download", json=payload, timeout=60.0)

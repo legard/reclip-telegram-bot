@@ -101,6 +101,50 @@ class TestGetInfo:
 
 class TestStartDownload:
     @pytest.mark.asyncio
+    async def test_preserves_legacy_payload(self, mock_response):
+        """Catches accidental omission or addition of fields on legacy downloads."""
+        response = mock_response(200, {"job_id": "job-1"})
+        with patch("reclip_client._client") as factory:
+            client = AsyncMock()
+            client.__aenter__ = AsyncMock(return_value=client)
+            client.__aexit__ = AsyncMock(return_value=False)
+            client.post = AsyncMock(return_value=response)
+            factory.return_value = client
+
+            await start_download("https://youtu.be/x", "video", "22", "Video")
+
+            client.post.assert_awaited_once_with(
+                "/api/download",
+                json={"url": "https://youtu.be/x", "format": "video", "title": "Video", "format_id": "22"},
+                timeout=60.0,
+            )
+
+    @pytest.mark.asyncio
+    async def test_sends_russian_height_without_format_id(self, mock_response):
+        """Catches dropped dubbing options and format_id=None leaking into the API payload."""
+        response = mock_response(200, {"job_id": "job-ru"})
+        with patch("reclip_client._client") as factory:
+            client = AsyncMock()
+            client.__aenter__ = AsyncMock(return_value=client)
+            client.__aexit__ = AsyncMock(return_value=False)
+            client.post = AsyncMock(return_value=response)
+            factory.return_value = client
+
+            await start_download(
+                "https://youtu.be/x", "video", None, "Video",
+                audio_language="ru", height=720,
+            )
+
+            client.post.assert_awaited_once_with(
+                "/api/download",
+                json={
+                    "url": "https://youtu.be/x", "format": "video", "title": "Video",
+                    "audio_language": "ru", "height": 720,
+                },
+                timeout=60.0,
+            )
+
+    @pytest.mark.asyncio
     async def test_success(self, mock_response):
         resp = mock_response(200, {"job_id": "abc1234567"})
         with patch("reclip_client._client") as mock_client:
