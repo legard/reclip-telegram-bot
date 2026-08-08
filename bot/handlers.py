@@ -213,13 +213,7 @@ async def cmd_setquality(
         await update.message.reply_text(f"Invalid quality. Options: {', '.join(valid)}")
         return
     if preference_store:
-        prefs = await preference_store.get(uid) or {}
-        await preference_store.save(
-            uid,
-            format=prefs.get("format", "video"),
-            quality=q,
-            audio_mode=prefs.get("audio_mode", "original"),
-        )
+        await preference_store.update(uid, quality=q)
     else:
         _user_prefs.setdefault(uid, {})["quality"] = q
     await update.message.reply_text(f"Default quality set to: {q}")
@@ -239,13 +233,7 @@ async def cmd_setformat(
         await update.message.reply_text("Invalid format. Options: video, audio")
         return
     if preference_store:
-        prefs = await preference_store.get(uid) or {}
-        await preference_store.save(
-            uid,
-            format=f,
-            quality=prefs.get("quality", "best"),
-            audio_mode=prefs.get("audio_mode", "original"),
-        )
+        await preference_store.update(uid, format=f)
     else:
         _user_prefs.setdefault(uid, {})["format"] = f
     await update.message.reply_text(f"Default format set to: {f}")
