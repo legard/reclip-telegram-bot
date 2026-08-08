@@ -11,7 +11,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import handlers
 from preferences import PreferenceStore
 from presentation import RetryStore
-from reclip_client import ReclipInfoError
+from reclip_client import ReclipDownloadError, ReclipInfoError
 
 
 def button_texts(markup):
@@ -118,6 +118,37 @@ async def test_wait_helper_keeps_download_alive_when_a_normal_card_edit_fails(mo
     result = await handlers._wait_for_download_job("job-1", FailingMessage())
 
     assert result["status"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_wait_helper_keeps_cancel_button_on_active_progress_edits(monkeypatch):
+    class ProgressMessage:
+        photo = False
+
+        def __init__(self):
+            self.edits = []
+
+        async def edit_text(self, text, **kwargs):
+            self.edits.append((text, kwargs))
+
+    message = ProgressMessage()
+    entry = {"cancel_callback_data": "cancel:7:abcd"}
+
+    async def fake_wait_for_job(job_id, on_status):
+        await on_status({"status": "downloading", "progress": {"percent": 10}})
+        return {"status": "done", "file_path": "/downloads/video.mp4"}
+
+    async def ignore_progress(**kwargs):
+        pass
+
+    monkeypatch.setattr(handlers, "wait_for_job", fake_wait_for_job)
+    monkeypatch.setattr(handlers.event_client, "send_progress", ignore_progress)
+
+    await handlers._wait_for_download_job("job-1", message, entry)
+
+    text, kwargs = message.edits[-1]
+    assert text == "Загрузка: 10%"
+    assert button_callbacks(kwargs["reply_markup"]) == ["cancel:7:abcd"]
 
 
 def test_format_buttons_show_ru_only_when_available():
@@ -575,6 +606,102 @@ async def test_active_job_cancel_calls_reclip_and_reports_cancelled(monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_active_job_cancel_remains_available_after_selection_ttl(monkeypatch):
+    key = handlers._state_key(10, 7, "abcd")
+    handlers._state[key] = {
+        "created": time.time() - handlers.STATE_TTL - 1,
+        "selection_started": True,
+        "job_id": "job-1",
+        "upload_started": False,
+    }
+    query = FakeQuery(data="cancel:7:abcd", chat_id=10, message_id=7)
+    cancelled_job_ids = []
+
+    async def cancel_reclip(job_id):
+        cancelled_job_ids.append(job_id)
+        return {"job_id": job_id, "status": "cancelled"}
+
+    async def ignore_cancelled(**kwargs):
+        pass
+
+    monkeypatch.setattr(handlers, "cancel_download", cancel_reclip)
+    monkeypatch.setattr(handlers.event_client, "send_download_cancelled", ignore_cancelled)
+
+    await handlers.cancel_callback(FakeUpdate(query), None)
+
+    assert cancelled_job_ids == ["job-1"]
+    assert key not in handlers._state
+
+
+@pytest.mark.asyncio
+async def test_pre_job_cancel_terminal_conflict_continues_normal_completion(monkeypatch, tmp_path):
+    downloaded_file = tmp_path / "video.mp4"
+    downloaded_file.touch()
+    key = handlers._state_key(10, 7, "abcd")
+
+    class DownloadMessage:
+        photo = False
+        chat = object()
+        chat_id = 10
+
+        async def edit_text(self, text, **kwargs):
+            pass
+
+        async def edit_reply_markup(self, *, reply_markup):
+            pass
+
+        async def delete(self):
+            pass
+
+    entry = {
+        "url": "https://youtu.be/x",
+        "info": {"title": "Video", "extractor": "youtube"},
+        "created": time.time(),
+        "user_id": 1,
+        "state_key": key,
+        "cancel_callback_data": "cancel:7:abcd",
+        "selection_started": True,
+        "cancel_requested": True,
+    }
+    handlers._state[key] = entry
+    cancelled_job_ids = []
+    uploaded_paths = []
+
+    async def fake_start(*args, **kwargs):
+        return "job-1"
+
+    async def terminal_cancel(job_id):
+        cancelled_job_ids.append(job_id)
+        raise ReclipDownloadError("Cancel request failed: 409", error_code="download_failed")
+
+    async def fake_wait(*args, **kwargs):
+        return {"status": "done", "file_path": str(downloaded_file)}
+
+    async def fake_upload(chat, local_path, **kwargs):
+        uploaded_paths.append(local_path)
+        return 1
+
+    async def ignore_event(**kwargs):
+        pass
+
+    monkeypatch.setattr(handlers, "start_download", fake_start)
+    monkeypatch.setattr(handlers, "cancel_download", terminal_cancel)
+    monkeypatch.setattr(handlers, "_wait_for_download_job", fake_wait)
+    monkeypatch.setattr(handlers, "send_local_path", fake_upload)
+    monkeypatch.setattr(handlers.event_client, "send_download_start", ignore_event)
+    monkeypatch.setattr(handlers.event_client, "send_download_done", ignore_event)
+    monkeypatch.setattr(handlers, "DOWNLOADS_PATH", str(tmp_path))
+
+    await handlers.download_and_send(
+        SimpleNamespace(message=DownloadMessage()), entry, format="video", format_id=None,
+    )
+
+    assert cancelled_job_ids == ["job-1"]
+    assert uploaded_paths == [downloaded_file]
+    assert key not in handlers._state
+
+
+@pytest.mark.asyncio
 async def test_late_cancel_during_upload_does_not_cancel_reclip(monkeypatch, tmp_path):
     uploaded_file = tmp_path / "video.mp4"
     uploaded_file.touch()
@@ -831,7 +958,7 @@ async def test_russian_download_forwards_height_and_reports_selected_quality(mon
         calls["start"].append((url, format, format_id, title, kwargs))
         return "job-1"
 
-    async def fake_wait(job_id, message):
+    async def fake_wait(job_id, message, entry):
         return {"status": "done", "file_path": str(downloaded_file)}
 
     async def fake_event_start(**kwargs):

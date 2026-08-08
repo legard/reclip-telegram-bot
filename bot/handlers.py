@@ -129,7 +129,7 @@ def _download_intent(
     return intent
 
 
-async def _wait_for_download_job(job_id: str, message):
+async def _wait_for_download_job(job_id: str, message, entry: dict | None = None):
     """Relay new ReClip progress states without duplicating Telegram edits."""
     card = message if isinstance(message, StatusCard) else StatusCard(message)
 
@@ -139,7 +139,10 @@ async def _wait_for_download_job(job_id: str, message):
 
         stage = status.get("stage") or "downloading"
         progress = status.get("progress")
-        await card.replace(format_progress(status))
+        if entry is None:
+            await card.replace(format_progress(status))
+        else:
+            await card.replace(format_progress(status), reply_markup=_cancel_markup(entry))
 
         try:
             await event_client.send_progress(
@@ -378,7 +381,12 @@ def _url_hash(url: str) -> str:
 
 def _evict_stale():
     now = time.time()
-    expired = [k for k, v in _state.items() if now - v["created"] > STATE_TTL]
+    expired = [
+        key for key, entry in _state.items()
+        if now - entry["created"] > STATE_TTL
+        and not entry.get("selection_started")
+        and not entry.get("job_id")
+    ]
     for k in expired:
         del _state[k]
 
@@ -934,16 +942,15 @@ async def download_and_send(
             result = await cancel_download(job_id)
         except ReclipError:
             logger.debug("Cancellation failed for newly created ReClip job %s", job_id, exc_info=True)
-            _remove_active_entry(entry)
-            return
-        if result.get("status") == "cancelled":
-            entry["cancelled"] = True
-            await event_client.send_download_cancelled(job_id=job_id)
-            _remove_active_entry(entry)
-            return
+        else:
+            if result.get("status") == "cancelled":
+                entry["cancelled"] = True
+                await event_client.send_download_cancelled(job_id=job_id)
+                _remove_active_entry(entry)
+                return
 
     try:
-        status = await _wait_for_download_job(job_id, card)
+        status = await _wait_for_download_job(job_id, card, entry)
     except ReclipError as error:
         error_code = _wait_error_message(error)
         await _present_error(card, error_code, intent=semantic)
