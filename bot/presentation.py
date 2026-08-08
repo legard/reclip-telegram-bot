@@ -272,8 +272,11 @@ class RetryStore:
         item = self._items.get(token)
         return dict(item[1]) if item is not None else None
 
-    def take(self, token: str) -> dict | None:
-        """Atomically consume a retry token so callbacks cannot replay it."""
+    def take(self, token: str, user_id: int | None = None) -> dict | None:
+        """Atomically consume a token only when its owner matches, if provided."""
         self._cleanup()
-        item = self._items.pop(token, None)
+        item = self._items.get(token)
+        if item is None or (user_id is not None and item[1].get("user_id") != user_id):
+            return None
+        self._items.pop(token)
         return dict(item[1]) if item is not None else None

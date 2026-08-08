@@ -204,6 +204,33 @@ async def test_retry_refetches_info_and_resolves_current_semantic_height(monkeyp
 
 
 @pytest.mark.asyncio
+async def test_non_owner_retry_callback_cannot_consume_the_owners_token(monkeypatch):
+    token = handlers._retry_store.put({
+        "url": "https://youtu.be/x", "format": "audio", "quality": "best",
+        "audio_mode": "original", "user_id": 42,
+    })
+    wrong_user = FakeQuery(data=f"retry:{token}", chat_id=10, message_id=7)
+    owner = FakeQuery(data=f"retry:{token}", chat_id=10, message_id=7)
+    started = []
+
+    async def fresh_info(url):
+        return {"title": "Новая версия"}
+
+    async def capture_download(*args, **kwargs):
+        started.append(kwargs)
+
+    monkeypatch.setattr(handlers, "get_info", fresh_info)
+    monkeypatch.setattr(handlers, "download_and_send", capture_download)
+
+    await handlers.retry_callback(FakeUpdate(wrong_user, user_id=7), None)
+    await handlers.retry_callback(FakeUpdate(owner, user_id=42), None)
+    await asyncio.sleep(0)
+
+    assert wrong_user.edited_text == "Время повтора истекло. Отправьте ссылку ещё раз."
+    assert len(started) == 1
+
+
+@pytest.mark.asyncio
 async def test_url_metadata_failure_offers_semantic_retry_with_default_intent(monkeypatch):
     class StatusMessage:
         photo = False

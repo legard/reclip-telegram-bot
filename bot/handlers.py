@@ -789,11 +789,11 @@ async def cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def retry_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     _, _, token = query.data.partition(":")
+    semantic = _retry_store.take(token, update.effective_user.id)
+    await query.answer()
     card = StatusCard(query.message, query=query)
-    semantic = _retry_store.take(token)
-    if not token or semantic is None or semantic.get("user_id") != update.effective_user.id:
+    if not token or semantic is None:
         await card.replace(TEXT["retry_expired"], reply_markup=None)
         return
 

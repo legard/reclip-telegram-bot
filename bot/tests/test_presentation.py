@@ -126,3 +126,14 @@ def test_retry_store_consumes_a_token_only_once():
 
     assert store.take(token)["url"] == "https://youtu.be/x"
     assert store.take(token) is None
+
+
+def test_retry_store_keeps_token_for_its_owner_when_a_different_user_tries_it():
+    store = RetryStore()
+    token = store.put({
+        "url": "https://youtu.be/x", "format": "video", "quality": "720",
+        "audio_mode": "original", "user_id": 42,
+    })
+
+    assert store.take(token, 7) is None
+    assert store.take(token, 42)["url"] == "https://youtu.be/x"
