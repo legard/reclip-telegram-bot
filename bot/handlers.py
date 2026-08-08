@@ -26,6 +26,16 @@ from reclip_client import (
 import event_client
 from upload import TelegramUploadError, send_local_path
 from preferences import PreferenceStore
+from presentation import (
+    RetryStore,
+    StatusCard,
+    TEXT,
+    error_text,
+    format_info,
+    format_progress,
+    is_retryable,
+    retry_callback_data,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -48,13 +58,14 @@ def _truncate_caption(text: str) -> str:
     return text[: CAPTION_MAX - 1] + "…"
 
 _state: dict[str, dict] = {}
+_retry_store = RetryStore()
 _stats = {"downloads": 0, "errors": 0, "started": time.time()}
 
 SUPPORTED_PLATFORMS = [
     "YouTube", "TikTok", "Instagram", "Twitter/X", "Reddit",
     "Facebook", "Vimeo", "Twitch", "Dailymotion", "SoundCloud",
     "Bandcamp", "Bilibili", "Pinterest", "Tumblr", "Threads",
-    "LinkedIn", "Loom", "Streamable", "and 1000+ more via yt-dlp",
+    "LinkedIn", "Loom", "Streamable", "и ещё 1000+ сайтов через yt-dlp",
 ]
 
 
@@ -112,32 +123,22 @@ def _download_intent(
             intent["audio_language"] = "ru"
             formats = russian_audio["formats"]
         else:
-            intent["fallback_note"] = "Русская дорожка недоступна — скачиваем оригинал."
+            intent["fallback_note"] = TEXT["russian_fallback"]
     intent["height"] = _select_height(formats, quality)
     return intent
 
 
 async def _wait_for_download_job(job_id: str, message):
     """Relay new ReClip progress states without duplicating Telegram edits."""
-    last_status_text = None
+    card = message if isinstance(message, StatusCard) else StatusCard(message)
 
     async def on_status(status):
-        nonlocal last_status_text
         if status.get("status") != "downloading":
             return
 
         stage = status.get("stage") or "downloading"
         progress = status.get("progress")
-        if stage == "postprocessing":
-            text = "Post-processing…"
-        elif progress and isinstance(progress, dict) and progress.get("percent") is not None:
-            text = f"Downloading… {progress['percent']}%"
-        else:
-            text = "Downloading…"
-
-        if text != last_status_text:
-            await _edit_safe(message, text)
-            last_status_text = text
+        await card.replace(format_progress(status))
 
         try:
             await event_client.send_progress(
@@ -156,57 +157,19 @@ async def _wait_for_download_job(job_id: str, message):
 
 
 def _wait_error_message(error: ReclipError) -> str:
-    if isinstance(error, ReclipJobLost):
-        return ReclipJobLost.message
-    if isinstance(error, ReclipServiceOutage):
-        return ReclipServiceOutage.message
-    if isinstance(error, ReclipJobDeadlineExceeded):
-        return ReclipJobDeadlineExceeded.message
-    return "Download service unavailable for more than 60 seconds."
+    return getattr(error, "error_code", "download_failed")
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "Hey! I'm ReClip Bot.\n\n"
-        "Send me a video or audio link and I'll download it for you.\n\n"
-        "Supported platforms: YouTube, TikTok, Instagram, Twitter, Reddit, "
-        "and 1000+ more.\n\n"
-        "Commands:\n"
-        "/help - Help and commands\n"
-        "/platforms - Supported platforms\n"
-        "/settings - Your preferences\n"
-        "/stats - Bot statistics\n"
-        "/mp3 <link> - Download directly as MP3\n"
-        "/mp4 <link> - Download best quality MP4\n"
-    )
-    await update.message.reply_text(text)
+    await update.message.reply_text(TEXT["start"])
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "*How to use ReClip Bot:*\n\n"
-        "1\\. Send a link \\(YouTube, TikTok, etc\\.\\)\n"
-        "2\\. Pick a format \\(MP4 or MP3\\)\n"
-        "3\\. Pick quality\n"
-        "4\\. File delivered to the chat\\!\n\n"
-        "*Shortcuts:*\n"
-        "/mp3 \\<link\\> \\- Direct MP3 download\n"
-        "/mp4 \\<link\\> \\- Best quality MP4\n"
-        "/best \\<link\\> \\- Best available quality\n\n"
-        "*Preferences:*\n"
-        "/setquality \\<best/720/480\\> \\- Default quality\n"
-        "/setformat \\<video/audio\\> \\- Default format\n"
-        "/settings \\- View your preferences\n\n"
-        "*Other:*\n"
-        "/platforms \\- Supported sites\n"
-        "/stats \\- Bot stats\n\n"
-        "You can also send multiple links in a single message\\!"
-    )
-    await update.message.reply_text(text, parse_mode="MarkdownV2")
+    await update.message.reply_text(TEXT["help"], parse_mode="MarkdownV2")
 
 
 async def cmd_platforms(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = "Supported platforms:\n\n" + "\n".join(f"  {p}" for p in SUPPORTED_PLATFORMS)
+    text = TEXT["platforms"] + "\n".join(f"  {p}" for p in SUPPORTED_PLATFORMS)
     await update.message.reply_text(text)
 
 
@@ -224,14 +187,9 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 disk_mb += f.stat().st_size / (1024 * 1024)
                 file_count += 1
 
-    text = (
-        f"ReClip Bot Stats:\n\n"
-        f"  Uptime: {hours}h {mins}m {secs}s\n"
-        f"  Downloads: {_stats['downloads']}\n"
-        f"  Errors: {_stats['errors']}\n"
-        f"  Cached files: {file_count}\n"
-        f"  Disk usage: {disk_mb:.1f} MB\n"
-        f"  Active sessions: {len(_state)}\n"
+    text = TEXT["stats"].format(
+        hours=hours, mins=mins, secs=secs, downloads=_stats["downloads"],
+        errors=_stats["errors"], files=file_count, disk=disk_mb, sessions=len(_state),
     )
     await update.message.reply_text(text)
 
@@ -253,14 +211,11 @@ def _settings_card(prefs: dict[str, str] | None, reset: bool = False):
     fmt = prefs["format"]
     audio_mode = prefs["audio_mode"]
     fmt_label = "MP4" if fmt == "video" else "MP3"
-    quality_label = "лучшее" if quality == "best" else f"{quality}p"
-    audio_label = "оригинал" if audio_mode == "original" else "русская, если доступна"
-    text = (
-        ("Настройки сброшены.\n\n" if reset else "")
-        + "Ваши настройки:\n\n"
-        + f"Формат: {fmt_label}\n"
-        + f"Качество: {quality_label}\n"
-        + f"Аудио: {audio_label}"
+    quality_label = TEXT["best"].lower() if quality == "best" else f"{quality}p"
+    audio_label = TEXT["original"].lower() if audio_mode == "original" else TEXT["ru_if_available"].lower()
+    text = TEXT["settings"].format(
+        reset=TEXT["settings_reset"] if reset else "", format=fmt_label,
+        quality=quality_label, audio=audio_label,
     )
     keyboard = InlineKeyboardMarkup([
         [
@@ -268,7 +223,7 @@ def _settings_card(prefs: dict[str, str] | None, reset: bool = False):
             InlineKeyboardButton("MP3", callback_data="settings:format:audio"),
         ],
         [
-            InlineKeyboardButton("Лучшее", callback_data="settings:quality:best"),
+            InlineKeyboardButton(TEXT["best"], callback_data="settings:quality:best"),
             InlineKeyboardButton("1080p", callback_data="settings:quality:1080"),
             InlineKeyboardButton("720p", callback_data="settings:quality:720"),
         ],
@@ -277,10 +232,10 @@ def _settings_card(prefs: dict[str, str] | None, reset: bool = False):
             InlineKeyboardButton("360p", callback_data="settings:quality:360"),
         ],
         [
-            InlineKeyboardButton("Оригинал", callback_data="settings:audio:original"),
-            InlineKeyboardButton("Русское, если доступно", callback_data="settings:audio:ru_if_available"),
+            InlineKeyboardButton(TEXT["original"], callback_data="settings:audio:original"),
+            InlineKeyboardButton(TEXT["ru_if_available"], callback_data="settings:audio:ru_if_available"),
         ],
-        [InlineKeyboardButton("Сбросить настройки", callback_data="settings:reset")],
+        [InlineKeyboardButton(TEXT["settings_reset_button"], callback_data="settings:reset")],
     ])
     return text, keyboard
 
@@ -319,16 +274,16 @@ async def cmd_setquality(
 ):
     uid = update.effective_user.id
     if not context.args:
-        await update.message.reply_text("Использование: /setquality <best/1080/720/480/360>")
+        await update.message.reply_text(TEXT["setquality_usage"])
         return
     q = {"лучшее": "best"}.get(context.args[0].lower(), context.args[0].lower())
     valid = ["best", "1080", "720", "480", "360"]
     if q not in valid:
-        await update.message.reply_text(f"Недопустимое качество. Варианты: {', '.join(valid)}")
+        await update.message.reply_text(TEXT["invalid_quality"].format(options=", ".join(valid)))
         return
     if preference_store:
         await preference_store.update(uid, quality=q)
-    await update.message.reply_text(f"Качество по умолчанию: {q}")
+    await update.message.reply_text(TEXT["quality_saved"].format(quality=q))
 
 
 async def cmd_setformat(
@@ -338,18 +293,18 @@ async def cmd_setformat(
 ):
     uid = update.effective_user.id
     if not context.args:
-        await update.message.reply_text("Использование: /setformat <video/audio>")
+        await update.message.reply_text(TEXT["setformat_usage"])
         return
     f = {
         "mp4": "video", "видео": "video", "video": "video",
         "mp3": "audio", "аудио": "audio", "audio": "audio",
     }.get(context.args[0].lower())
     if f not in ("video", "audio"):
-        await update.message.reply_text("Недопустимый формат. Варианты: video/audio или mp4/mp3")
+        await update.message.reply_text(TEXT["invalid_format"])
         return
     if preference_store:
         await preference_store.update(uid, format=f)
-    await update.message.reply_text(f"Формат по умолчанию: {f}")
+    await update.message.reply_text(TEXT["format_saved"].format(format=f))
 
 
 def _extract_urls_from_command(update: Update) -> list[str]:
@@ -366,10 +321,10 @@ async def cmd_mp3(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Direct MP3 download without format picker."""
     urls = _extract_urls_from_command(update)
     if not urls:
-        await update.message.reply_text("Usage: /mp3 <link>\nOr reply to a message containing a link.")
+        await update.message.reply_text(TEXT["mp3_usage"])
         return
     for url in urls:
-        msg = await update.message.reply_text("Downloading MP3...")
+        msg = await update.message.reply_text(TEXT["mp3_start"])
         await _direct_download(update, msg, url, "audio", None)
 
 
@@ -377,10 +332,10 @@ async def cmd_mp4(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Direct best-quality MP4 download without format picker."""
     urls = _extract_urls_from_command(update)
     if not urls:
-        await update.message.reply_text("Usage: /mp4 <link>\nOr reply to a message containing a link.")
+        await update.message.reply_text(TEXT["mp4_usage"])
         return
     for url in urls:
-        msg = await update.message.reply_text("Downloading MP4 (best quality)...")
+        msg = await update.message.reply_text(TEXT["mp4_start"])
         await _direct_download(update, msg, url, "video", None)
 
 
@@ -391,106 +346,25 @@ async def cmd_best(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _direct_download(update: Update, status_msg, url: str, fmt: str, format_id: str | None):
     """Download without the interactive picker flow."""
+    card = StatusCard(status_msg)
+    semantic = {
+        "url": url, "format": fmt, "quality": "best",
+        "audio_mode": "original", "user_id": update.effective_user.id,
+    }
     try:
         info = await get_info(url)
-    except ReclipServiceDown:
-        await _edit_safe(status_msg, "Download service temporarily unavailable.")
-        _stats["errors"] += 1
-        return
-    except ReclipError as e:
-        await _edit_safe(status_msg, f"Error: {e}")
-        _stats["errors"] += 1
-        return
-
-    title = info.get("title", "download")
-    entry = {"url": url, "info": info, "user_id": update.effective_user.id}
-
-    try:
-        job_id = await start_download(url, fmt, format_id, title)
-    except ReclipError as e:
-        await _edit_safe(status_msg, f"Error: {e}")
-        _stats["errors"] += 1
-        return
-
-    try:
-        await event_client.send_download_start(
-            job_id=job_id,
-            user_id=update.effective_user.id,
-            username=update.effective_user.username or str(update.effective_user.id),
-            chat_id=update.effective_chat.id,
-            url=url,
-            platform=info.get("extractor", "unknown"),
-            format=fmt,
-            quality=format_id or "best",
-            title=title,
-        )
-    except Exception:
-        pass
-
-    _direct_download_start = time.time()
-    try:
-        status = await _wait_for_download_job(job_id, status_msg)
     except ReclipError as error:
-        message = _wait_error_message(error)
-        await _edit_safe(status_msg, message)
+        await _present_error(card, getattr(error, "error_code", "download_failed"), intent=semantic)
         _stats["errors"] += 1
-        await event_client.send_download_error(job_id=job_id, error_message=message)
         return
 
-    if status.get("status") == "error":
-        error_message = status.get("error", "Unknown error")
-        await _edit_safe(status_msg, f"Error: {error_message}")
-        _stats["errors"] += 1
-        await event_client.send_download_error(job_id=job_id, error_message=error_message)
-        return
-
-    file_path = status.get("file_path") or status.get("filename")
-    video_meta = {
-        "width": status.get("width"),
-        "height": status.get("height"),
-        "duration": status.get("duration"),
+    entry = {
+        "url": url, "info": info, "user_id": update.effective_user.id,
+        "created": time.time(), "retry_intent": semantic,
     }
-
-    local_path = Path(DOWNLOADS_PATH) / Path(file_path).name
-    if not local_path.exists():
-        local_path = Path(file_path)
-    if not local_path.exists():
-        await _edit_safe(status_msg, "File not found after download.")
-        _stats["errors"] += 1
-        await event_client.send_download_error(job_id=job_id, error_message="File not found after download")
-        return
-
-    try:
-        file_size = await send_local_path(
-            update.message.chat,
-            local_path,
-            caption=_truncate_caption(title),
-            video_meta=video_meta if fmt == "video" else None,
-        )
-    except TelegramUploadError:
-        logger.exception("Upload failed after retry")
-        await _edit_safe(status_msg, "Failed to upload file to Telegram.")
-        _stats["errors"] += 1
-        await event_client.send_download_error(
-            job_id=job_id, error_message="Failed to upload to Telegram"
-        )
-        return
-
-    _stats["downloads"] += 1
-    try:
-        await event_client.send_download_done(
-            job_id=job_id,
-            file_size_bytes=file_size,
-            duration_seconds=time.time() - _direct_download_start,
-            filename=local_path.name,
-        )
-    except Exception:
-        pass
-
-    try:
-        await status_msg.edit_text(f"Sent: {title}")
-    except Exception:
-        pass
+    await download_and_send(
+        SimpleNamespace(message=status_msg), entry, format=fmt, format_id=format_id,
+    )
 
 
 def _state_key(chat_id: int, message_id: int, url_hash: str) -> str:
@@ -508,15 +382,67 @@ def _evict_stale():
         del _state[k]
 
 
-def _format_duration(seconds: int | float | None) -> str:
-    if not seconds:
-        return "Unknown"
-    seconds = int(seconds)
-    mins, secs = divmod(seconds, 60)
-    hours, mins = divmod(mins, 60)
-    if hours:
-        return f"{hours}:{mins:02d}:{secs:02d}"
-    return f"{mins}:{secs:02d}"
+def _semantic_quality(info: dict, format_id: str | None, height: int | None) -> str:
+    selected_height = height
+    if selected_height is None and format_id:
+        selected = next(
+            (item for item in info.get("formats", []) if str(item.get("id")) == str(format_id)),
+            {},
+        )
+        selected_height = selected.get("height")
+    quality = str(selected_height) if selected_height is not None else "best"
+    return quality if quality in {"best", "1080", "720", "480", "360"} else "best"
+
+
+def _retry_intent(entry: dict, format: str, format_id: str | None, audio_language: str | None, height: int | None) -> dict:
+    saved = entry.get("retry_intent")
+    if saved:
+        return dict(saved)
+    return {
+        "url": entry["url"],
+        "format": format,
+        "quality": "best" if format == "audio" else _semantic_quality(entry["info"], format_id, height),
+        "audio_mode": "ru" if audio_language == "ru" else "original",
+        "user_id": entry["user_id"],
+    }
+
+
+def _retry_keyboard(token: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(TEXT["retry"], callback_data=retry_callback_data(token))
+    ]])
+
+
+async def _present_error(card: StatusCard, code: str, *, intent: dict | None = None) -> None:
+    if intent is not None and is_retryable(code):
+        token = _retry_store.put(intent)
+        await card.replace(error_text(code), reply_markup=_retry_keyboard(token))
+    else:
+        await card.replace(error_text(code), reply_markup=None)
+
+
+def _resolve_retry_intent(semantic: dict, info: dict) -> tuple[dict | None, str | None]:
+    if semantic["format"] == "audio":
+        return {
+            "format": "audio", "format_id": None,
+            "audio_language": None, "height": None,
+        }, None
+    if semantic["audio_mode"] == "ru":
+        russian_audio = info.get("russian_audio") or {}
+        formats = russian_audio.get("formats", [])
+        if not russian_audio.get("available") or not formats:
+            return None, "russian_audio_unavailable"
+        return {
+            "format": "video", "format_id": None,
+            "audio_language": "ru", "height": _select_height(formats, semantic["quality"]),
+        }, None
+    intent = _download_intent(
+        semantic["format"], semantic["quality"], semantic["audio_mode"], info,
+    )
+    note = intent.pop("fallback_note", None)
+    if note:
+        intent["start_note"] = note
+    return intent, None
 
 
 def _build_format_buttons(
@@ -531,7 +457,7 @@ def _build_format_buttons(
         )
     buttons.append(InlineKeyboardButton("MP3", callback_data=f"fmt:{message_id}:{url_hash}:audio"))
     return InlineKeyboardMarkup([buttons, [
-        InlineKeyboardButton("Cancel", callback_data=f"cancel:{message_id}:{url_hash}")
+        InlineKeyboardButton(TEXT["cancel"], callback_data=f"cancel:{message_id}:{url_hash}")
     ]])
 
 
@@ -543,8 +469,9 @@ def _build_quality_buttons(message_id: int, url_hash: str, formats: list[dict]) 
             InlineKeyboardButton(label, callback_data=f"qty:{message_id}:{url_hash}:{fmt['id']}")
         )
     rows = [buttons[i : i + 3] for i in range(0, len(buttons), 3)]
-    rows.append([InlineKeyboardButton("Best quality", callback_data=f"qty:{message_id}:{url_hash}:best")])
-    rows.append([InlineKeyboardButton("Cancel", callback_data=f"cancel:{message_id}:{url_hash}")])
+    rows.append([InlineKeyboardButton(TEXT["best_quality"], callback_data=f"qty:{message_id}:{url_hash}:best")])
+    rows.append([InlineKeyboardButton(TEXT["back"], callback_data=f"fmt:{message_id}:{url_hash}:back")])
+    rows.append([InlineKeyboardButton(TEXT["cancel"], callback_data=f"cancel:{message_id}:{url_hash}")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -560,9 +487,10 @@ def _build_russian_quality_buttons(
     ]
     rows = [buttons[index:index + 3] for index in range(0, len(buttons), 3)]
     rows.append([
-        InlineKeyboardButton("Best quality", callback_data=f"ruqty:{message_id}:{url_hash}:best")
+        InlineKeyboardButton(TEXT["best_quality"], callback_data=f"ruqty:{message_id}:{url_hash}:best")
     ])
-    rows.append([InlineKeyboardButton("Cancel", callback_data=f"cancel:{message_id}:{url_hash}")])
+    rows.append([InlineKeyboardButton(TEXT["back"], callback_data=f"fmt:{message_id}:{url_hash}:back")])
+    rows.append([InlineKeyboardButton(TEXT["cancel"], callback_data=f"cancel:{message_id}:{url_hash}")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -579,18 +507,13 @@ async def url_handler(
 
     for url in urls:
         uhash = _url_hash(url)
-        status_msg = await update.message.reply_text("Fetching info...")
+        status_msg = await update.message.reply_text(TEXT["info_loading"])
+        card = StatusCard(status_msg)
 
         try:
             info = await get_info(url)
-        except ReclipServiceDown:
-            await status_msg.edit_text("Download service temporarily unavailable.")
-            continue
-        except ReclipInfoError as e:
-            await status_msg.edit_text(f"Failed to fetch info: {e}")
-            continue
-        except ReclipError as e:
-            await status_msg.edit_text(f"Error: {e}")
+        except ReclipError as error:
+            await _present_error(card, getattr(error, "error_code", "download_failed"))
             continue
 
         preferences = await load_preferences(update.effective_user.id, preference_store)
@@ -600,6 +523,11 @@ async def url_handler(
                 "user_id": update.effective_user.id,
                 "info": info,
                 "created": time.time(),
+                "retry_intent": {
+                    "url": url, "format": preferences["format"],
+                    "quality": preferences["quality"], "audio_mode": preferences["audio_mode"],
+                    "user_id": update.effective_user.id,
+                },
             }
             intent = _download_intent(
                 preferences["format"], preferences["quality"],
@@ -613,67 +541,19 @@ async def url_handler(
             )
             continue
 
-        title = info.get("title", "Unknown")
-        extractor = info.get("extractor", "Unknown")
-        duration = _format_duration(info.get("duration"))
-        uploader = info.get("uploader", "")
-        thumbnail = info.get("thumbnail")
-
-        # Telegram caption limit is 1024 chars. Reserve ~200 for metadata lines
-        # and markdown escaping overhead, cap the title at 800 chars.
-        title_short = title if len(title) <= 800 else title[:799] + "…"
-
-        caption_lines = [
-            f"*{_escape_md(title_short)}*",
-            f"Platform: {_escape_md(extractor)}",
-            f"Duration: {_escape_md(duration)}",
-        ]
-        if uploader:
-            caption_lines.append(f"Uploader: {_escape_md(uploader)}")
-        caption = "\n".join(caption_lines)
-
-        key = _state_key(update.effective_chat.id, status_msg.message_id, uhash)
+        keyboard = _build_format_buttons(
+            status_msg.message_id, uhash, info.get("russian_audio")
+        )
+        await card.show_info(format_info(info), keyboard, photo=info.get("thumbnail"))
+        shown_message = card.message
+        key = _state_key(update.effective_chat.id, shown_message.message_id, uhash)
         _state[key] = {
             "url": url,
             "user_id": update.effective_user.id,
             "info": info,
-            "message_id": status_msg.message_id,
+            "message_id": shown_message.message_id,
             "created": time.time(),
         }
-
-        keyboard = _build_format_buttons(
-            status_msg.message_id, uhash, info.get("russian_audio")
-        )
-
-        if thumbnail:
-            try:
-                await status_msg.delete()
-                sent = await update.message.reply_photo(
-                    photo=thumbnail,
-                    caption=caption,
-                    parse_mode="MarkdownV2",
-                    reply_markup=keyboard,
-                )
-                _state[key]["message_id"] = sent.message_id
-                old_key = key
-                key = _state_key(update.effective_chat.id, sent.message_id, uhash)
-                _state[key] = _state.pop(old_key)
-            except Exception:
-                logger.exception("Failed to send thumbnail, falling back to text")
-                sent = await update.message.reply_text(
-                    caption, parse_mode="MarkdownV2", reply_markup=keyboard
-                )
-                _state[key]["message_id"] = sent.message_id
-                old_key = key
-                key = _state_key(update.effective_chat.id, sent.message_id, uhash)
-                _state[key] = _state.pop(old_key)
-        else:
-            await status_msg.edit_text(caption, parse_mode="MarkdownV2", reply_markup=keyboard)
-
-
-def _escape_md(text: str) -> str:
-    special = r"_*[]()~`>#+-=|{}.!\\"
-    return "".join(f"\\{c}" if c in special else c for c in str(text))
 
 
 async def format_callback(
@@ -689,6 +569,8 @@ async def format_callback(
     if len(parts) != 4:
         return
     _, msg_id_str, uhash, fmt = parts
+    if not msg_id_str.isdecimal():
+        return
     msg_id = int(msg_id_str)
 
     key = _state_key(query.message.chat_id, msg_id, uhash)
@@ -697,18 +579,22 @@ async def format_callback(
         key = _state_key(query.message.chat_id, query.message.message_id, uhash)
         entry = _state.get(key)
     if not entry:
-        await query.edit_message_text("Session expired. Please send the link again.")
+        await StatusCard(query.message, query=query).replace(TEXT["selection_expired"])
         return
 
     if fmt == "back":
         keyboard = _build_format_buttons(
             query.message.message_id, uhash, entry["info"].get("russian_audio")
         )
-        await query.edit_message_reply_markup(reply_markup=keyboard)
+        await StatusCard(query.message, query=query).set_buttons(keyboard)
         return
 
     if fmt == "audio":
         _state.pop(key, None)
+        entry["retry_intent"] = {
+            "url": entry["url"], "format": "audio", "quality": "best",
+            "audio_mode": "original", "user_id": entry["user_id"],
+        }
         await save_final_selection(
             entry["user_id"],
             {"format": "audio", "quality": "best", "audio_mode": "original"},
@@ -732,16 +618,16 @@ async def format_callback(
             return
 
         keyboard = _build_quality_buttons(query.message.message_id, uhash, formats[:6])
-        await query.edit_message_reply_markup(reply_markup=keyboard)
+        await StatusCard(query.message, query=query).set_buttons(keyboard)
     elif fmt == "video_ru":
         russian_audio = entry["info"].get("russian_audio") or {}
         formats = russian_audio.get("formats", [])
         if not formats:
-            await query.edit_message_text("Session expired. Please send the link again.")
+            await StatusCard(query.message, query=query).replace(error_text("russian_audio_unavailable"))
             return
 
         keyboard = _build_russian_quality_buttons(query.message.message_id, uhash, formats)
-        await query.edit_message_reply_markup(reply_markup=keyboard)
+        await StatusCard(query.message, query=query).set_buttons(keyboard)
 
 
 async def quality_callback(
@@ -757,6 +643,8 @@ async def quality_callback(
     if len(parts) != 4:
         return
     _, msg_id_str, uhash, format_id = parts
+    if not msg_id_str.isdecimal():
+        return
     msg_id = int(msg_id_str)
 
     key = _state_key(query.message.chat_id, msg_id, uhash)
@@ -765,7 +653,7 @@ async def quality_callback(
         key = _state_key(query.message.chat_id, query.message.message_id, uhash)
         entry = _state.get(key)
     if not entry:
-        await query.edit_message_text("Session expired. Please send the link again.")
+        await StatusCard(query.message, query=query).replace(TEXT["selection_expired"])
         return
 
     fid = None if format_id == "best" else format_id
@@ -782,6 +670,10 @@ async def quality_callback(
         {"format": "video", "quality": saved_quality, "audio_mode": "original"},
         preference_store,
     )
+    entry["retry_intent"] = {
+        "url": entry["url"], "format": "video", "quality": saved_quality,
+        "audio_mode": "original", "user_id": entry["user_id"],
+    }
     asyncio.create_task(
         download_and_send(query, entry, format="video", format_id=fid)
     )
@@ -801,7 +693,7 @@ async def russian_quality_callback(
         return
     _, msg_id_str, uhash, height_value = parts
     if not msg_id_str.isdecimal():
-        await query.edit_message_text("Session expired. Please send the link again.")
+        await StatusCard(query.message, query=query).replace(TEXT["selection_expired"])
         return
     msg_id = int(msg_id_str)
 
@@ -811,7 +703,7 @@ async def russian_quality_callback(
         key = _state_key(query.message.chat_id, query.message.message_id, uhash)
         entry = _state.get(key)
     if not entry:
-        await query.edit_message_text("Session expired. Please send the link again.")
+        await StatusCard(query.message, query=query).replace(TEXT["selection_expired"])
         return
 
     if height_value == "best":
@@ -819,7 +711,7 @@ async def russian_quality_callback(
     elif height_value.isdecimal():
         height = int(height_value)
     else:
-        await query.edit_message_text("Session expired. Please send the link again.")
+        await StatusCard(query.message, query=query).replace(TEXT["selection_expired"])
         return
 
     _state.pop(key, None)
@@ -834,6 +726,11 @@ async def russian_quality_callback(
         },
         preference_store,
     )
+    entry["retry_intent"] = {
+        "url": entry["url"], "format": "video",
+        "quality": str(height) if str(height) in {"1080", "720", "480", "360"} else "best",
+        "audio_mode": "ru", "user_id": entry["user_id"],
+    }
     asyncio.create_task(
         download_and_send(
             query,
@@ -861,10 +758,34 @@ async def cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if _state.pop(key, None) is None:
         return
 
-    if query.message.photo:
-        await query.edit_message_caption(caption="Cancelled.", reply_markup=None)
-    else:
-        await query.edit_message_text("Cancelled.", reply_markup=None)
+    await StatusCard(query.message, query=query).replace(TEXT["cancelled"], reply_markup=None)
+
+
+async def retry_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    _, _, token = query.data.partition(":")
+    card = StatusCard(query.message, query=query)
+    semantic = _retry_store.get(token)
+    if not token or semantic is None or semantic.get("user_id") != update.effective_user.id:
+        await card.replace(TEXT["retry_expired"], reply_markup=None)
+        return
+
+    await card.replace(TEXT["info_loading"], reply_markup=None)
+    try:
+        info = await get_info(semantic["url"])
+    except ReclipError as error:
+        await _present_error(card, getattr(error, "error_code", "download_failed"), intent=semantic)
+        return
+    intent, error_code = _resolve_retry_intent(semantic, info)
+    if error_code:
+        await _present_error(card, error_code, intent=semantic)
+        return
+    entry = {
+        "url": semantic["url"], "user_id": semantic["user_id"], "info": info,
+        "created": time.time(), "retry_intent": semantic,
+    }
+    asyncio.create_task(download_and_send(query, entry, **intent))
 
 
 async def download_and_send(
@@ -881,10 +802,12 @@ async def download_and_send(
     message = query.message
     url = entry["url"]
     title = entry["info"].get("title", "download")
+    card = StatusCard(message)
+    semantic = _retry_intent(entry, format, format_id, audio_language, height)
 
     try:
-        start_text = f"{start_note}\n\nStarting download..." if start_note else "Starting download..."
-        await message.edit_caption(caption=start_text) if message.photo else await message.edit_text(start_text)
+        start_text = f"{start_note}\n\n{TEXT['download_start']}" if start_note else TEXT["download_start"]
+        await card.replace(start_text, reply_markup=None)
     except Exception:
         pass
 
@@ -897,16 +820,8 @@ async def download_and_send(
             audio_language=audio_language,
             height=height,
         )
-    except ReclipServiceDown:
-        await _edit_safe(message, "Download service temporarily unavailable.")
-        _stats["errors"] += 1
-        return
-    except ReclipDownloadError as e:
-        await _edit_safe(message, f"Download failed: {e}")
-        _stats["errors"] += 1
-        return
-    except ReclipError as e:
-        await _edit_safe(message, f"Error: {e}")
+    except ReclipError as error:
+        await _present_error(card, getattr(error, "error_code", "download_failed"), intent=semantic)
         _stats["errors"] += 1
         return
 
@@ -926,19 +841,19 @@ async def download_and_send(
         pass
 
     try:
-        status = await _wait_for_download_job(job_id, message)
+        status = await _wait_for_download_job(job_id, card)
     except ReclipError as error:
-        error_message = _wait_error_message(error)
-        await _edit_safe(message, error_message)
+        error_code = _wait_error_message(error)
+        await _present_error(card, error_code, intent=semantic)
         _stats["errors"] += 1
-        await event_client.send_download_error(job_id=job_id, error_message=error_message)
+        await event_client.send_download_error(job_id=job_id, error_message=error_code)
         return
 
     if status.get("status") == "error":
-        error_message = status.get("error", "Unknown error")
-        await _edit_safe(message, f"Error: {error_message}")
+        error_code = status.get("error_code", "download_failed")
+        await _present_error(card, error_code, intent=semantic)
         _stats["errors"] += 1
-        await event_client.send_download_error(job_id=job_id, error_message=error_message)
+        await event_client.send_download_error(job_id=job_id, error_message=error_code)
         return
 
     file_path = status.get("file_path") or status.get("filename")
@@ -952,9 +867,9 @@ async def download_and_send(
     if not local_path.exists():
         local_path = Path(file_path)
     if not local_path.exists():
-        await _edit_safe(message, "File not found after download.")
+        await _present_error(card, "file_missing", intent=semantic)
         _stats["errors"] += 1
-        await event_client.send_download_error(job_id=job_id, error_message="File not found after download")
+        await event_client.send_download_error(job_id=job_id, error_message="file_missing")
         return
 
     try:
@@ -966,10 +881,10 @@ async def download_and_send(
         )
     except TelegramUploadError:
         logger.exception("Upload failed after retry")
-        await _edit_safe(message, "Failed to upload file to Telegram.")
+        await _present_error(card, "upload_failed", intent=semantic)
         _stats["errors"] += 1
         await event_client.send_download_error(
-            job_id=job_id, error_message="Failed to upload to Telegram"
+            job_id=job_id, error_message="upload_failed"
         )
         return
 
@@ -984,24 +899,7 @@ async def download_and_send(
     except Exception:
         pass
 
-    try:
-        sent_text = _truncate_caption(f"Sent: {title}")
-        if message.photo:
-            await message.edit_caption(caption=sent_text)
-        else:
-            await message.edit_text(sent_text)
-    except Exception:
-        pass
-
-async def _edit_safe(message, text: str):
-    try:
-        if message.photo:
-            await message.edit_caption(caption=text)
-        else:
-            await message.edit_text(text)
-    except Exception:
-        logger.debug("Failed to edit message with: %s", text)
-
+    await card.complete()
 
 def _with_preferences(callback, preference_store: PreferenceStore | None):
     @wraps(callback)
@@ -1061,6 +959,9 @@ def register_handlers(
     ))
     application.add_handler(CallbackQueryHandler(
         _authorized_callback(cancel_callback, allowed_user_ids), pattern=r"^cancel:"
+    ))
+    application.add_handler(CallbackQueryHandler(
+        _authorized_callback(retry_callback, allowed_user_ids), pattern=r"^retry:"
     ))
     application.add_handler(CallbackQueryHandler(
         _authorized_callback(settings_callback, allowed_user_ids, preference_store), pattern=r"^settings:"

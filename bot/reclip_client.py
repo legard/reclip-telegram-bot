@@ -16,33 +16,49 @@ JOB_DEADLINE_GRACE_SECONDS = 60
 
 
 class ReclipError(Exception):
-    pass
+    error_code = "download_failed"
+
+    def __init__(self, message: str = "", *, error_code: str | None = None):
+        super().__init__(message)
+        if error_code is not None:
+            self.error_code = error_code
 
 
 class ReclipInfoError(ReclipError):
-    pass
+    error_code = "unavailable"
 
 
 class ReclipDownloadError(ReclipError):
-    pass
+    error_code = "download_failed"
 
 
 class ReclipServiceDown(ReclipError):
-    pass
+    error_code = "service_unavailable"
 
 
 class ReclipJobLost(ReclipError):
     """The in-memory ReClip job disappeared, usually after a service restart."""
 
     message = "Download interrupted because the service restarted. Please retry."
+    error_code = "job_lost"
 
 
 class ReclipServiceOutage(ReclipError):
     message = "Download service unavailable for more than 60 seconds."
+    error_code = "service_unavailable"
 
 
 class ReclipJobDeadlineExceeded(ReclipError):
     message = "Download service did not finalize the job within its deadline."
+    error_code = "job_timeout"
+
+
+def _response_error_code(response, default: str) -> str:
+    try:
+        code = response.json().get("error_code")
+    except (AttributeError, ValueError, TypeError):
+        code = None
+    return code if isinstance(code, str) else default
 
 
 def _client() -> httpx.AsyncClient:
@@ -59,9 +75,12 @@ async def get_info(url: str) -> dict:
     except httpx.ConnectError:
         raise ReclipServiceDown("Cannot reach reclip service")
     except httpx.TimeoutException:
-        raise ReclipInfoError("Info request timed out")
+        raise ReclipInfoError("Info request timed out", error_code="info_timeout")
     except httpx.HTTPStatusError as e:
-        raise ReclipInfoError(f"Info request failed: {e.response.status_code}")
+        raise ReclipInfoError(
+            f"Info request failed: {e.response.status_code}",
+            error_code=_response_error_code(e.response, "unavailable"),
+        )
     except Exception as e:
         raise ReclipInfoError(f"Info request failed: {e}")
 
@@ -91,9 +110,12 @@ async def start_download(
     except httpx.ConnectError:
         raise ReclipServiceDown("Cannot reach reclip service")
     except httpx.TimeoutException:
-        raise ReclipDownloadError("Download request timed out")
+        raise ReclipDownloadError("Download request timed out", error_code="network")
     except httpx.HTTPStatusError as e:
-        raise ReclipDownloadError(f"Download request failed: {e.response.status_code}")
+        raise ReclipDownloadError(
+            f"Download request failed: {e.response.status_code}",
+            error_code=_response_error_code(e.response, "download_failed"),
+        )
     except (KeyError, ValueError) as e:
         raise ReclipDownloadError(f"Malformed response: {e}")
     except ReclipError:
@@ -111,11 +133,14 @@ async def poll_status(job_id: str, *, timeout: float = 10.0) -> dict:
     except httpx.ConnectError:
         raise ReclipServiceDown("Cannot reach reclip service")
     except httpx.TimeoutException:
-        raise ReclipError("Status request timed out")
+        raise ReclipError("Status request timed out", error_code="network")
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 404:
             raise ReclipJobLost(ReclipJobLost.message)
-        raise ReclipError(f"Status request failed: {e.response.status_code}")
+        raise ReclipError(
+            f"Status request failed: {e.response.status_code}",
+            error_code=_response_error_code(e.response, "unavailable"),
+        )
     except Exception as e:
         raise ReclipError(f"Status request failed: {e}")
 

@@ -98,6 +98,21 @@ class TestGetInfo:
             with pytest.raises(ReclipInfoError):
                 await get_info("https://invalid-site.com/nope")
 
+    @pytest.mark.asyncio
+    async def test_http_error_preserves_stable_server_error_code(self, mock_response):
+        resp = mock_response(401, {"error": "login required", "error_code": "auth_required"})
+        with patch("reclip_client._client") as mock_client:
+            client = AsyncMock()
+            client.__aenter__ = AsyncMock(return_value=client)
+            client.__aexit__ = AsyncMock(return_value=False)
+            client.post = AsyncMock(return_value=resp)
+            mock_client.return_value = client
+
+            with pytest.raises(ReclipInfoError) as caught:
+                await get_info("https://invalid-site.com/nope")
+
+        assert caught.value.error_code == "auth_required"
+
 
 class TestStartDownload:
     @pytest.mark.asyncio

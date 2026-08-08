@@ -10,6 +10,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import handlers
 from preferences import PreferenceStore
+from presentation import RetryStore
+from reclip_client import ReclipInfoError
 
 
 def button_texts(markup):
@@ -52,6 +54,8 @@ class FakeUpdate:
 @pytest.fixture(autouse=True)
 def clear_handler_state():
     handlers._state.clear()
+    if hasattr(handlers, "_retry_store"):
+        handlers._retry_store = RetryStore()
     yield
     handlers._state.clear()
 
@@ -90,7 +94,7 @@ async def test_wait_helper_edits_only_when_download_stage_or_progress_changes(mo
     result = await handlers._wait_for_download_job("job-1", message)
 
     assert result["status"] == "done"
-    assert message.edits == ["Downloading… 10%", "Post-processing…"]
+    assert message.edits == ["Загрузка: 10%", "Обработка файла…"]
 
 
 def test_format_buttons_show_ru_only_when_available():
@@ -99,8 +103,8 @@ def test_format_buttons_show_ru_only_when_available():
         7, "abcd", {"available": True, "formats": [{"height": 720, "label": "720p"}]}
     )
 
-    assert button_texts(hidden) == ["MP4", "MP3", "Cancel"]
-    assert button_texts(shown) == ["MP4", "MP4 • RU", "MP3", "Cancel"]
+    assert button_texts(hidden) == ["MP4", "MP3", "Отменить"]
+    assert button_texts(shown) == ["MP4", "MP4 • RU", "MP3", "Отменить"]
     assert "fmt:7:abcd:video_ru" in button_callbacks(shown)
     assert button_callbacks(hidden)[-1] == "cancel:7:abcd"
 
@@ -112,16 +116,104 @@ def test_russian_quality_buttons_store_height_not_format_id():
     )
 
     assert button_callbacks(markup) == [
-        "ruqty:7:abcd:1080", "ruqty:7:abcd:720", "ruqty:7:abcd:best", "cancel:7:abcd",
+        "ruqty:7:abcd:1080", "ruqty:7:abcd:720", "ruqty:7:abcd:best",
+        "fmt:7:abcd:back", "cancel:7:abcd",
     ]
-    assert button_texts(markup) == ["1080p", "720p", "Best quality", "Cancel"]
+    assert button_texts(markup) == ["1080p", "720p", "Лучшее качество", "Назад", "Отменить"]
 
 
 def test_quality_buttons_include_cancel():
     markup = handlers._build_quality_buttons(7, "abcd", [{"id": "22", "label": "720p"}])
 
-    assert button_callbacks(markup) == ["qty:7:abcd:22", "qty:7:abcd:best", "cancel:7:abcd"]
-    assert button_texts(markup) == ["720p", "Best quality", "Cancel"]
+    assert button_callbacks(markup) == [
+        "qty:7:abcd:22", "qty:7:abcd:best", "fmt:7:abcd:back", "cancel:7:abcd",
+    ]
+    assert button_texts(markup) == ["720p", "Лучшее качество", "Назад", "Отменить"]
+
+
+def test_quality_menus_offer_russian_back_navigation():
+    normal = handlers._build_quality_buttons(7, "abcd", [{"id": "22", "label": "720p"}])
+    russian = handlers._build_russian_quality_buttons(7, "abcd", [{"height": 720, "label": "720p"}])
+
+    assert "Назад" in button_texts(normal)
+    assert "fmt:7:abcd:back" in button_callbacks(normal)
+    assert "Назад" in button_texts(russian)
+    assert "fmt:7:abcd:back" in button_callbacks(russian)
+
+
+@pytest.mark.asyncio
+async def test_retry_refetches_info_and_resolves_current_semantic_height(monkeypatch):
+    store = RetryStore()
+    token = store.put({
+        "url": "https://youtu.be/x", "format": "video", "quality": "480",
+        "audio_mode": "original", "user_id": 42,
+    })
+    handlers._retry_store = store
+    query = FakeQuery(data=f"retry:{token}", chat_id=10, message_id=7)
+    started = []
+
+    async def fresh_info(url):
+        return {
+            "title": "Новая версия", "formats": [{"id": "new-360", "height": 360}],
+        }
+
+    async def capture_download(query_arg, entry, **kwargs):
+        started.append((entry, kwargs))
+
+    monkeypatch.setattr(handlers, "get_info", fresh_info)
+    monkeypatch.setattr(handlers, "download_and_send", capture_download)
+
+    await handlers.retry_callback(FakeUpdate(query), None)
+    await asyncio.sleep(0)
+
+    assert len(started) == 1
+    entry, intent = started[0]
+    assert entry["url"] == "https://youtu.be/x"
+    assert entry["info"]["title"] == "Новая версия"
+    assert intent == {
+        "format": "video", "format_id": None,
+        "audio_language": None, "height": 360,
+    }
+
+
+@pytest.mark.asyncio
+async def test_direct_download_shows_safe_russian_coded_error(monkeypatch):
+    class StatusMessage:
+        photo = False
+
+        def __init__(self):
+            self.edits = []
+
+        async def edit_text(self, text, **kwargs):
+            self.edits.append((text, kwargs))
+
+    status = StatusMessage()
+    update = SimpleNamespace(effective_user=SimpleNamespace(id=42))
+
+    async def unavailable(url):
+        raise ReclipInfoError("socket timeout at internal host", error_code="network")
+
+    monkeypatch.setattr(handlers, "get_info", unavailable)
+
+    await handlers._direct_download(update, status, "https://youtu.be/x", "audio", None)
+
+    text, kwargs = status.edits[0]
+    assert text == "Не удалось загрузить файл. Попробуйте ещё раз."
+    assert button_texts(kwargs["reply_markup"]) == ["Повторить"]
+
+
+@pytest.mark.asyncio
+async def test_start_card_is_presented_in_russian():
+    replies = []
+
+    class Message:
+        async def reply_text(self, text, **kwargs):
+            replies.append(text)
+
+    await handlers.cmd_start(SimpleNamespace(message=Message()), None)
+
+    assert "Отправьте мне ссылку" in replies[0]
+    assert "Send me" not in replies[0]
 
 
 def test_select_height_prefers_exact_then_lower_then_smallest():
@@ -263,7 +355,7 @@ async def test_download_start_keeps_russian_audio_fallback_note_visible(monkeypa
         start_note="Русская дорожка недоступна — скачиваем оригинал.",
     )
 
-    assert edits[0] == "Русская дорожка недоступна — скачиваем оригинал.\n\nStarting download..."
+    assert edits[0] == "Русская дорожка недоступна — скачиваем оригинал.\n\nНачинаем загрузку…"
 
 
 @pytest.mark.asyncio
@@ -321,7 +413,7 @@ async def test_cancel_removes_session_and_replaces_text_card():
     await handlers.cancel_callback(FakeUpdate(query), None)
 
     assert key not in handlers._state
-    assert query.edited_text == "Cancelled."
+    assert query.edited_text == "Отменено."
     assert query.reply_markup is None
 
 
@@ -334,7 +426,7 @@ async def test_cancel_removes_session_and_replaces_photo_caption():
     await handlers.cancel_callback(FakeUpdate(query), None)
 
     assert key not in handlers._state
-    assert query.edited_caption == "Cancelled."
+    assert query.edited_caption == "Отменено."
     assert query.reply_markup is None
 
 
@@ -439,7 +531,7 @@ async def test_russian_quality_callback_rejects_malformed_height():
 
     await handlers.russian_quality_callback(FakeUpdate(query), None)
 
-    assert query.edited_text == "Session expired. Please send the link again."
+    assert query.edited_text == "Время выбора истекло. Отправьте ссылку ещё раз."
 
 
 @pytest.mark.asyncio
@@ -448,7 +540,7 @@ async def test_russian_quality_callback_rejects_malformed_message_id():
 
     await handlers.russian_quality_callback(FakeUpdate(query), None)
 
-    assert query.edited_text == "Session expired. Please send the link again."
+    assert query.edited_text == "Время выбора истекло. Отправьте ссылку ещё раз."
 
 
 @pytest.mark.asyncio
@@ -488,7 +580,7 @@ async def test_russian_quality_callback_expires_stale_session():
 
     await handlers.russian_quality_callback(FakeUpdate(query), None)
 
-    assert query.edited_text == "Session expired. Please send the link again."
+    assert query.edited_text == "Время выбора истекло. Отправьте ссылку ещё раз."
 
 
 @pytest.mark.asyncio
@@ -503,7 +595,7 @@ async def test_russian_format_callback_rejects_missing_russian_formats():
 
     await handlers.format_callback(FakeUpdate(query), None)
 
-    assert query.edited_text == "Session expired. Please send the link again."
+    assert query.edited_text == "Русская дорожка недоступна для этого видео."
 
 
 @pytest.mark.asyncio
@@ -592,5 +684,6 @@ def test_register_handlers_registers_selection_callbacks():
         ("^qty:", handlers.quality_callback),
         ("^ruqty:", handlers.russian_quality_callback),
         ("^cancel:", handlers.cancel_callback),
+        ("^retry:", handlers.retry_callback),
         ("^settings:", handlers.settings_callback),
     }
