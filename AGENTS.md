@@ -39,7 +39,8 @@ ADMIN_PASSWORD=changeme DB_PATH=./reclip.db \
 cd bot
 pip install -r requirements.txt
 BOT_TOKEN=<token> RECLIP_URL=http://localhost:8899 \
-  ALLOWED_USER_IDS=<your-telegram-user-id> DOWNLOADS_PATH=../reclip/downloads python bot.py
+  ALLOWED_USER_IDS=<your-telegram-user-id> BOT_DB_PATH=./bot.db \
+  DOWNLOADS_PATH=../reclip/downloads python bot.py
 ```
 
 The ReClip runtime contract is Deno >= 2.3.0 in `PATH`, bundled EJS and the
@@ -58,6 +59,10 @@ cd bot
 pip install -r requirements.txt
 pip install pytest pytest-asyncio
 python -m pytest tests/ -v
+
+# ReClip API and Docker Compose contract tests (run from repository root)
+cd ..
+python -m pytest reclip/tests/ -v
 
 # Dashboard tests
 cd dashboard
@@ -121,6 +126,29 @@ Commonly overridden for local dev:
 - `SECRET_KEY=change-me` (dashboard cookie signing)
 
 See `.env.example` for the full list with defaults.
+
+The allowlist is mandatory: the bot exits at startup if `ALLOWED_USER_IDS` is
+missing, empty, or contains non-positive/non-numeric IDs. Use a comma-separated
+value such as `ALLOWED_USER_IDS=123,456`. In Compose, `BOT_DB_PATH=/data/bot.db`
+is backed by the durable `bot-data` volume, which preserves a user's saved
+format, quality, and audio preferences across bot restarts.
+
+## Telegram UX Contract
+
+- User-facing status, controls, and errors are in Russian. For eligible
+  YouTube videos, `MP4 • RU` selects a separate Russian audio track; it does
+  not silently replace a missing track with the original audio.
+- `/mp3 <ссылка>` downloads MP3 immediately. `/mp4 <ссылка>` downloads the
+  best MP4 immediately, and `/best <ссылка>` is its one-shot alias. These
+  commands bypass the format picker.
+- `/settings` saves default format, quality, and audio preference in
+  `BOT_DB_PATH`. **Сбросить настройки** removes those saved values and restores
+  MP4, best quality, and original audio.
+- Retry cards hold semantic intent for 24 hours and can be used once. They are
+  intentionally in memory, so all outstanding retry buttons expire after a bot
+  restart and users must send the link again.
+- Cancellation is available during selection, download, and post-processing,
+  but only before Telegram upload begins. Uploading files cannot be cancelled.
 
 ## Code Conventions
 

@@ -74,10 +74,15 @@ cp .env.example .env
 3. Edit `.env` with your credentials:
 ```bash
 BOT_TOKEN=your-bot-token-from-botfather
-ALLOWED_USER_IDS=123456789
+ALLOWED_USER_IDS=123,456
 TELEGRAM_API_ID=your-api-id
 TELEGRAM_API_HASH=your-api-hash
 ```
+
+`ALLOWED_USER_IDS` is mandatory. The bot exits during startup when the
+allowlist is missing, empty, or contains anything other than positive numeric
+Telegram user IDs. This keeps the bot private; use a comma-separated list such
+as `ALLOWED_USER_IDS=123,456` for multiple users.
 
 To get Telegram API credentials:
 - Go to https://my.telegram.org
@@ -104,8 +109,8 @@ All configuration is via environment variables in `.env`:
 | Variable | Default | Description |
 |---|---|---|
 | `BOT_TOKEN` | (required) | Telegram bot token from @BotFather |
-| `ALLOWED_USER_IDS` | (required) | Comma-separated Telegram user IDs allowed to use the private bot |
-| `BOT_DB_PATH` | `/data/bot.db` | Separate SQLite database for durable bot preferences |
+| `ALLOWED_USER_IDS` | (required) | Mandatory comma-separated positive Telegram user IDs allowed to use the private bot; an absent or invalid value stops startup |
+| `BOT_DB_PATH` | `/data/bot.db` | SQLite database for durable per-user format, quality, and audio preferences; Docker stores it on the `bot-data` volume |
 | `TELEGRAM_API_ID` | (required) | Telegram API ID from my.telegram.org |
 | `TELEGRAM_API_HASH` | (required) | Telegram API hash from my.telegram.org |
 | `MAX_CONCURRENT_DOWNLOADS` | 3 | Max parallel downloads |
@@ -121,6 +126,11 @@ All configuration is via environment variables in `.env`:
 `JOB_TIMEOUT` is the shared ReClip deadline for both services. Existing
 deployments that have only `DOWNLOAD_TIMEOUT` continue to use that value;
 otherwise the default is 9000 seconds.
+
+`BOT_DB_PATH` should point to durable storage. In Docker Compose it is
+`/data/bot.db`, backed by the `bot-data` volume, so `/settings` preferences
+survive bot container restarts. Set a writable local path when running the bot
+outside Docker.
 
 ## Admin Dashboard
 
@@ -152,12 +162,30 @@ Then access it at http://localhost:8899.
 2. Bot sends "Fetching info..." immediately
 3. Bot calls reclip's API to get video metadata
 4. Bot displays thumbnail, title, platform, and format buttons (MP4/MP3)
-5. When YouTube exposes a separate Russian track, bot also displays `MP4 • RU`; it opens Russian resolutions plus `Best quality`
+5. The bot's messages, controls, and errors are in Russian. When YouTube exposes a separate Russian track, it also displays `MP4 • RU`; it opens Russian resolutions plus `Best quality`
 6. You tap MP4 to see ordinary quality options (1080p, 720p, etc.) or MP3 for audio
 7. `MP4 • RU` downloads only the selected Russian track and never substitutes the original audio
 8. Bot starts the download and shows real-time progress
 9. Bot uploads the file to the Telegram chat
 10. Cleanup task removes old files automatically
+
+### Commands, settings, and retries
+
+- `/mp3 <ссылка>` starts an MP3 download immediately, without the format picker.
+- `/mp4 <ссылка>` starts an MP4 download immediately in the best available
+  quality, without the format picker. `/best <ссылка>` is the same one-shot
+  best-quality MP4 action.
+- `/settings` stores each user's default MP4/MP3 format, quality, and original
+  or Russian-when-available audio choice in `BOT_DB_PATH`. The **Сбросить
+  настройки** button deletes those saved preferences and returns the user to
+  the defaults: MP4, best quality, and original audio.
+- Retry buttons preserve only the intended URL, format, quality, audio choice,
+  and owner for 24 hours. A retry is one-time and disappears after expiry; bot
+  restarts also discard outstanding retry buttons, so the user must send the
+  link again.
+- **Отменить** is available while choosing or while ReClip is downloading and
+  processing. Cancellation is allowed only before the Telegram upload starts;
+  once upload has begun, the card no longer offers cancellation.
 
 ## Development
 
@@ -178,7 +206,15 @@ POT_PROVIDER_URL=http://localhost:4416 python app.py &
 
 # Start the bot
 cd bot && pip install -r requirements.txt
-BOT_TOKEN=your-token ALLOWED_USER_IDS=123456789 RECLIP_URL=http://localhost:8899 DOWNLOADS_PATH=../reclip/downloads python bot.py
+BOT_TOKEN=your-token ALLOWED_USER_IDS=123,456 BOT_DB_PATH=./bot.db RECLIP_URL=http://localhost:8899 DOWNLOADS_PATH=../reclip/downloads python bot.py
+```
+
+### Tests
+
+From the repository root, run the ReClip API and Compose contract tests with:
+
+```bash
+python -m pytest reclip/tests/ -v
 ```
 
 ### Project structure
