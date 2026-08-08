@@ -9,6 +9,7 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import handlers
+from preferences import PreferenceStore
 
 
 def button_texts(markup):
@@ -43,8 +44,9 @@ class FakeQuery:
 
 
 class FakeUpdate:
-    def __init__(self, query):
+    def __init__(self, query, user_id=42):
         self.callback_query = query
+        self.effective_user = SimpleNamespace(id=user_id)
 
 
 @pytest.fixture(autouse=True)
@@ -122,6 +124,127 @@ def test_quality_buttons_include_cancel():
     assert button_texts(markup) == ["720p", "Best quality", "Cancel"]
 
 
+def test_select_height_prefers_exact_then_lower_then_smallest():
+    formats = [{"height": 1080}, {"height": 720}, {"height": 360}]
+
+    assert handlers._select_height(formats, "720") == 720
+    assert handlers._select_height(formats, "480") == 360
+    assert handlers._select_height([{ "height": 720 }, {"height": 1080}], "480") == 720
+    assert handlers._select_height(formats, "best") is None
+
+
+def test_download_intent_uses_available_russian_audio_or_notes_original_fallback():
+    info_with_russian = {
+        "formats": [{"height": 1080}, {"height": 720}],
+        "russian_audio": {"available": True, "formats": [{"height": 720}, {"height": 360}]},
+    }
+
+    assert handlers._download_intent("video", "480", "ru_if_available", info_with_russian) == {
+        "format": "video", "format_id": None, "audio_language": "ru", "height": 360,
+    }
+    assert handlers._download_intent("video", "480", "ru_if_available", {"formats": [{"height": 720}]}) == {
+        "format": "video", "format_id": None, "audio_language": None, "height": 720,
+        "fallback_note": "Русская дорожка недоступна — скачиваем оригинал.",
+    }
+    assert handlers._download_intent("audio", "720", "original", info_with_russian) == {
+        "format": "audio", "format_id": None, "audio_language": None, "height": None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_settings_callbacks_update_and_reset_durable_preferences(tmp_path):
+    store = PreferenceStore(str(tmp_path / "bot.db"))
+    await store.initialize()
+    query = FakeQuery(data="settings:format:audio", chat_id=10, message_id=7)
+
+    await handlers.settings_callback(FakeUpdate(query), None, store)
+    assert await store.get(42) == {
+        "format": "audio", "quality": "best", "audio_mode": "original",
+    }
+
+    query.data = "settings:quality:720"
+    await handlers.settings_callback(FakeUpdate(query), None, store)
+    query.data = "settings:audio:ru_if_available"
+    await handlers.settings_callback(FakeUpdate(query), None, store)
+    assert await store.get(42) == {
+        "format": "audio", "quality": "720", "audio_mode": "ru_if_available",
+    }
+
+    query.data = "settings:reset"
+    await handlers.settings_callback(FakeUpdate(query), None, store)
+    assert await store.get(42) is None
+    assert "Настройки сброшены" in query.edited_text
+
+
+@pytest.mark.asyncio
+async def test_first_russian_mp4_choice_saves_soft_future_audio_mode(tmp_path, monkeypatch):
+    store = PreferenceStore(str(tmp_path / "bot.db"))
+    await store.initialize()
+    query = FakeQuery(data="ruqty:7:abcd:720", chat_id=10, message_id=7)
+    handlers._state[handlers._state_key(10, 7, "abcd")] = {
+        "url": "https://youtu.be/x", "info": {"title": "Video"},
+        "created": time.time(), "user_id": 42,
+    }
+
+    async def ignore_download(*args, **kwargs):
+        pass
+
+    monkeypatch.setattr(handlers, "download_and_send", ignore_download)
+
+    await handlers.russian_quality_callback(FakeUpdate(query), None, store)
+    await asyncio.sleep(0)
+
+    assert await store.get(42) == {
+        "format": "video", "quality": "720", "audio_mode": "ru_if_available",
+    }
+
+
+@pytest.mark.asyncio
+async def test_saved_preferences_auto_start_semantic_download_without_session(monkeypatch, tmp_path):
+    store = PreferenceStore(str(tmp_path / "bot.db"))
+    await store.initialize()
+    await store.save(42, format="video", quality="480", audio_mode="ru_if_available")
+    started = []
+
+    class StatusMessage:
+        message_id = 7
+        chat = object()
+        photo = False
+
+        async def edit_text(self, text, **kwargs):
+            self.text = text
+
+    status = StatusMessage()
+
+    class Message:
+        text = "https://youtu.be/x"
+
+        async def reply_text(self, text, **kwargs):
+            return status
+
+    update = SimpleNamespace(
+        message=Message(), effective_user=SimpleNamespace(id=42), effective_chat=SimpleNamespace(id=10),
+    )
+
+    async def fake_info(url):
+        return {"title": "Video", "formats": [{"height": 720}]}
+
+    async def fake_download(query, entry, **kwargs):
+        started.append((entry, kwargs))
+
+    monkeypatch.setattr(handlers, "get_info", fake_info)
+    monkeypatch.setattr(handlers, "download_and_send", fake_download)
+
+    await handlers.url_handler(update, None, store)
+    await asyncio.sleep(0)
+
+    assert started[0][1] == {
+        "format": "video", "format_id": None, "audio_language": None, "height": 720,
+    }
+    assert status.text == "Русская дорожка недоступна — скачиваем оригинал."
+    assert handlers._state == {}
+
+
 @pytest.mark.asyncio
 async def test_cancel_removes_session_and_replaces_text_card():
     key = handlers._state_key(10, 7, "abcd")
@@ -161,6 +284,17 @@ async def test_repeated_cancel_does_not_start_download(monkeypatch):
     await handlers.cancel_callback(FakeUpdate(query), None)
 
     assert started == []
+
+
+@pytest.mark.asyncio
+async def test_authorized_cancel_callback_keeps_two_argument_handler_contract():
+    query = FakeQuery(data="cancel:7:abcd", chat_id=10, message_id=7)
+    handlers._state[handlers._state_key(10, 7, "abcd")] = {"created": time.time()}
+    callback = handlers._authorized_callback(handlers.cancel_callback, frozenset({42}))
+
+    await callback(FakeUpdate(query), None)
+
+    assert handlers._state == {}
 
 
 @pytest.mark.asyncio
@@ -391,4 +525,5 @@ def test_register_handlers_registers_selection_callbacks():
         ("^qty:", handlers.quality_callback),
         ("^ruqty:", handlers.russian_quality_callback),
         ("^cancel:", handlers.cancel_callback),
+        ("^settings:", handlers.settings_callback),
     }

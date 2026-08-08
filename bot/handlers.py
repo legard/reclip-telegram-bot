@@ -6,6 +6,7 @@ import os
 import re
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
 from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
@@ -48,7 +49,6 @@ def _truncate_caption(text: str) -> str:
 
 _state: dict[str, dict] = {}
 _stats = {"downloads": 0, "errors": 0, "started": time.time()}
-_user_prefs: dict[int, dict] = {}  # user_id -> {"quality": "best"|"720"|"480", "format": "video"|"audio"}
 
 SUPPORTED_PLATFORMS = [
     "YouTube", "TikTok", "Instagram", "Twitter/X", "Reddit",
@@ -56,6 +56,65 @@ SUPPORTED_PLATFORMS = [
     "Bandcamp", "Bilibili", "Pinterest", "Tumblr", "Threads",
     "LinkedIn", "Loom", "Streamable", "and 1000+ more via yt-dlp",
 ]
+
+
+async def load_preferences(
+    user_id: int, preference_store: PreferenceStore | None = None,
+) -> dict[str, str] | None:
+    if preference_store is None:
+        return None
+    return await preference_store.get(user_id)
+
+
+async def save_final_selection(
+    user_id: int,
+    intent: dict,
+    preference_store: PreferenceStore | None = None,
+) -> None:
+    if preference_store is None:
+        return
+    await preference_store.save(
+        user_id,
+        format=intent["format"],
+        quality=intent["quality"],
+        audio_mode=intent["audio_mode"],
+    )
+
+
+def _select_height(formats: list[dict], requested: str) -> int | None:
+    if requested == "best":
+        return None
+    heights = sorted({int(item["height"]) for item in formats if item.get("height")})
+    if not heights:
+        return None
+    target = int(requested)
+    return target if target in heights else max(
+        (height for height in heights if height <= target), default=min(heights)
+    )
+
+
+def _download_intent(
+    format: str, quality: str, audio_mode: str, info: dict,
+) -> dict:
+    intent = {
+        "format": format,
+        "format_id": None,
+        "audio_language": None,
+        "height": None,
+    }
+    if format == "audio":
+        return intent
+
+    formats = info.get("formats", [])
+    if audio_mode == "ru_if_available":
+        russian_audio = info.get("russian_audio") or {}
+        if russian_audio.get("available") and russian_audio.get("formats"):
+            intent["audio_language"] = "ru"
+            formats = russian_audio["formats"]
+        else:
+            intent["fallback_note"] = "Русская дорожка недоступна — скачиваем оригинал."
+    intent["height"] = _select_height(formats, quality)
+    return intent
 
 
 async def _wait_for_download_job(job_id: str, message):
@@ -183,19 +242,74 @@ async def cmd_settings(
     preference_store: PreferenceStore | None = None,
 ):
     uid = update.effective_user.id
-    prefs = await preference_store.get(uid) if preference_store else _user_prefs.get(uid, {})
-    prefs = prefs or {}
-    quality = prefs.get("quality", "best")
-    fmt = prefs.get("format", "video")
+    prefs = await load_preferences(uid, preference_store)
+    text, keyboard = _settings_card(prefs)
+    await update.message.reply_text(text, reply_markup=keyboard)
+
+
+def _settings_card(prefs: dict[str, str] | None, reset: bool = False):
+    prefs = prefs or {"format": "video", "quality": "best", "audio_mode": "original"}
+    quality = prefs["quality"]
+    fmt = prefs["format"]
+    audio_mode = prefs["audio_mode"]
+    fmt_label = "MP4" if fmt == "video" else "MP3"
+    quality_label = "лучшее" if quality == "best" else f"{quality}p"
+    audio_label = "оригинал" if audio_mode == "original" else "русская, если доступна"
     text = (
-        f"Your preferences:\n\n"
-        f"  Default quality: {quality}\n"
-        f"  Default format: {fmt}\n\n"
-        f"Change:\n"
-        f"  /setquality <best/720/480>\n"
-        f"  /setformat <video/audio>\n"
+        ("Настройки сброшены.\n\n" if reset else "")
+        + "Ваши настройки:\n\n"
+        + f"Формат: {fmt_label}\n"
+        + f"Качество: {quality_label}\n"
+        + f"Аудио: {audio_label}"
     )
-    await update.message.reply_text(text)
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("MP4", callback_data="settings:format:video"),
+            InlineKeyboardButton("MP3", callback_data="settings:format:audio"),
+        ],
+        [
+            InlineKeyboardButton("Лучшее", callback_data="settings:quality:best"),
+            InlineKeyboardButton("1080p", callback_data="settings:quality:1080"),
+            InlineKeyboardButton("720p", callback_data="settings:quality:720"),
+        ],
+        [
+            InlineKeyboardButton("480p", callback_data="settings:quality:480"),
+            InlineKeyboardButton("360p", callback_data="settings:quality:360"),
+        ],
+        [
+            InlineKeyboardButton("Оригинал", callback_data="settings:audio:original"),
+            InlineKeyboardButton("Русское, если доступно", callback_data="settings:audio:ru_if_available"),
+        ],
+        [InlineKeyboardButton("Сбросить настройки", callback_data="settings:reset")],
+    ])
+    return text, keyboard
+
+
+async def settings_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    preference_store: PreferenceStore | None = None,
+):
+    query = update.callback_query
+    await query.answer()
+    parts = query.data.split(":")
+    if parts == ["settings", "reset"]:
+        if preference_store:
+            await preference_store.clear(update.effective_user.id)
+        text, keyboard = _settings_card(None, reset=True)
+    elif len(parts) == 3 and parts[1] in {"format", "quality", "audio"}:
+        field = {"format": "format", "quality": "quality", "audio": "audio_mode"}[parts[1]]
+        try:
+            if preference_store:
+                await preference_store.update(update.effective_user.id, **{field: parts[2]})
+        except ValueError:
+            return
+        text, keyboard = _settings_card(
+            await load_preferences(update.effective_user.id, preference_store)
+        )
+    else:
+        return
+    await query.edit_message_text(text, reply_markup=keyboard)
 
 
 async def cmd_setquality(
@@ -205,18 +319,16 @@ async def cmd_setquality(
 ):
     uid = update.effective_user.id
     if not context.args:
-        await update.message.reply_text("Usage: /setquality <best/1080/720/480/360>")
+        await update.message.reply_text("Использование: /setquality <best/1080/720/480/360>")
         return
-    q = context.args[0].lower()
+    q = {"лучшее": "best"}.get(context.args[0].lower(), context.args[0].lower())
     valid = ["best", "1080", "720", "480", "360"]
     if q not in valid:
-        await update.message.reply_text(f"Invalid quality. Options: {', '.join(valid)}")
+        await update.message.reply_text(f"Недопустимое качество. Варианты: {', '.join(valid)}")
         return
     if preference_store:
         await preference_store.update(uid, quality=q)
-    else:
-        _user_prefs.setdefault(uid, {})["quality"] = q
-    await update.message.reply_text(f"Default quality set to: {q}")
+    await update.message.reply_text(f"Качество по умолчанию: {q}")
 
 
 async def cmd_setformat(
@@ -226,17 +338,18 @@ async def cmd_setformat(
 ):
     uid = update.effective_user.id
     if not context.args:
-        await update.message.reply_text("Usage: /setformat <video/audio>")
+        await update.message.reply_text("Использование: /setformat <video/audio>")
         return
-    f = context.args[0].lower()
+    f = {
+        "mp4": "video", "видео": "video", "video": "video",
+        "mp3": "audio", "аудио": "audio", "audio": "audio",
+    }.get(context.args[0].lower())
     if f not in ("video", "audio"):
-        await update.message.reply_text("Invalid format. Options: video, audio")
+        await update.message.reply_text("Недопустимый формат. Варианты: video/audio или mp4/mp3")
         return
     if preference_store:
         await preference_store.update(uid, format=f)
-    else:
-        _user_prefs.setdefault(uid, {})["format"] = f
-    await update.message.reply_text(f"Default format set to: {f}")
+    await update.message.reply_text(f"Формат по умолчанию: {f}")
 
 
 def _extract_urls_from_command(update: Update) -> list[str]:
@@ -453,7 +566,11 @@ def _build_russian_quality_buttons(
     return InlineKeyboardMarkup(rows)
 
 
-async def url_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def url_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    preference_store: PreferenceStore | None = None,
+):
     _evict_stale()
     text = update.message.text or ""
     urls = URL_REGEX.findall(text)
@@ -474,6 +591,26 @@ async def url_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             continue
         except ReclipError as e:
             await status_msg.edit_text(f"Error: {e}")
+            continue
+
+        preferences = await load_preferences(update.effective_user.id, preference_store)
+        if preferences:
+            entry = {
+                "url": url,
+                "user_id": update.effective_user.id,
+                "info": info,
+                "created": time.time(),
+            }
+            intent = _download_intent(
+                preferences["format"], preferences["quality"],
+                preferences["audio_mode"], info,
+            )
+            fallback_note = intent.pop("fallback_note", None)
+            if fallback_note:
+                await status_msg.edit_text(fallback_note)
+            asyncio.create_task(
+                download_and_send(SimpleNamespace(message=status_msg), entry, **intent)
+            )
             continue
 
         title = info.get("title", "Unknown")
@@ -539,7 +676,11 @@ def _escape_md(text: str) -> str:
     return "".join(f"\\{c}" if c in special else c for c in str(text))
 
 
-async def format_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def format_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    preference_store: PreferenceStore | None = None,
+):
     _evict_stale()
     query = update.callback_query
     await query.answer()
@@ -568,6 +709,11 @@ async def format_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if fmt == "audio":
         _state.pop(key, None)
+        await save_final_selection(
+            entry["user_id"],
+            {"format": "audio", "quality": "best", "audio_mode": "original"},
+            preference_store,
+        )
         asyncio.create_task(
             download_and_send(query, entry, format="audio", format_id=None)
         )
@@ -575,6 +721,11 @@ async def format_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         formats = entry["info"].get("formats", [])
         if not formats:
             _state.pop(key, None)
+            await save_final_selection(
+                entry["user_id"],
+                {"format": "video", "quality": "best", "audio_mode": "original"},
+                preference_store,
+            )
             asyncio.create_task(
                 download_and_send(query, entry, format="video", format_id=None)
             )
@@ -593,7 +744,11 @@ async def format_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_reply_markup(reply_markup=keyboard)
 
 
-async def quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def quality_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    preference_store: PreferenceStore | None = None,
+):
     _evict_stale()
     query = update.callback_query
     await query.answer()
@@ -615,12 +770,28 @@ async def quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     fid = None if format_id == "best" else format_id
     _state.pop(key, None)
+    selected = next(
+        (item for item in entry["info"].get("formats", []) if str(item.get("id")) == format_id),
+        {},
+    )
+    saved_quality = str(selected.get("height", "best"))
+    if saved_quality not in {"best", "1080", "720", "480", "360"}:
+        saved_quality = "best"
+    await save_final_selection(
+        entry["user_id"],
+        {"format": "video", "quality": saved_quality, "audio_mode": "original"},
+        preference_store,
+    )
     asyncio.create_task(
         download_and_send(query, entry, format="video", format_id=fid)
     )
 
 
-async def russian_quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def russian_quality_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    preference_store: PreferenceStore | None = None,
+):
     _evict_stale()
     query = update.callback_query
     await query.answer()
@@ -652,6 +823,15 @@ async def russian_quality_callback(update: Update, context: ContextTypes.DEFAULT
         return
 
     _state.pop(key, None)
+    await save_final_selection(
+        entry["user_id"],
+        {
+            "format": "video",
+            "quality": str(height) if height is not None else "best",
+            "audio_mode": "ru_if_available",
+        },
+        preference_store,
+    )
     asyncio.create_task(
         download_and_send(
             query,
@@ -827,7 +1007,11 @@ def _with_preferences(callback, preference_store: PreferenceStore | None):
     return wrapped
 
 
-def _authorized_callback(callback, allowed_user_ids: frozenset[int]):
+def _authorized_callback(
+    callback,
+    allowed_user_ids: frozenset[int],
+    preference_store: PreferenceStore | None = None,
+):
     @wraps(callback)
     async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
@@ -835,7 +1019,9 @@ def _authorized_callback(callback, allowed_user_ids: frozenset[int]):
         if user is None or user.id not in allowed_user_ids:
             await query.answer()
             return
-        return await callback(update, context)
+        if preference_store is None:
+            return await callback(update, context)
+        return await callback(update, context, preference_store)
 
     return wrapped
 
@@ -856,8 +1042,22 @@ def register_handlers(
     application.add_handler(CommandHandler("mp3", cmd_mp3, filters=allowed))
     application.add_handler(CommandHandler("mp4", cmd_mp4, filters=allowed))
     application.add_handler(CommandHandler("best", cmd_best, filters=allowed))
-    application.add_handler(MessageHandler(allowed & filters.TEXT & ~filters.COMMAND, url_handler))
-    application.add_handler(CallbackQueryHandler(_authorized_callback(format_callback, allowed_user_ids), pattern=r"^fmt:"))
-    application.add_handler(CallbackQueryHandler(_authorized_callback(quality_callback, allowed_user_ids), pattern=r"^qty:"))
-    application.add_handler(CallbackQueryHandler(_authorized_callback(russian_quality_callback, allowed_user_ids), pattern=r"^ruqty:"))
-    application.add_handler(CallbackQueryHandler(_authorized_callback(cancel_callback, allowed_user_ids), pattern=r"^cancel:"))
+    application.add_handler(MessageHandler(
+        allowed & filters.TEXT & ~filters.COMMAND,
+        _with_preferences(url_handler, preference_store),
+    ))
+    application.add_handler(CallbackQueryHandler(
+        _authorized_callback(format_callback, allowed_user_ids, preference_store), pattern=r"^fmt:"
+    ))
+    application.add_handler(CallbackQueryHandler(
+        _authorized_callback(quality_callback, allowed_user_ids, preference_store), pattern=r"^qty:"
+    ))
+    application.add_handler(CallbackQueryHandler(
+        _authorized_callback(russian_quality_callback, allowed_user_ids, preference_store), pattern=r"^ruqty:"
+    ))
+    application.add_handler(CallbackQueryHandler(
+        _authorized_callback(cancel_callback, allowed_user_ids), pattern=r"^cancel:"
+    ))
+    application.add_handler(CallbackQueryHandler(
+        _authorized_callback(settings_callback, allowed_user_ids, preference_store), pattern=r"^settings:"
+    ))
