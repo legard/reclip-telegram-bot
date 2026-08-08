@@ -159,12 +159,12 @@ Then access it at http://localhost:8899.
 ## How It Works
 
 1. You send a URL to the bot
-2. Bot sends "Fetching info..." immediately
+2. Bot sends "Получаем информацию…" immediately
 3. Bot calls reclip's API to get video metadata
 4. With no saved preferences, bot displays thumbnail, title, platform, and format buttons (MP4/MP3)
 5. The final manual selection persists its format, quality, and audio choice for that user
 6. Later ordinary URLs start automatically from those saved semantic preferences
-7. The bot's messages, controls, and errors are in Russian. When YouTube exposes a separate Russian track, it also displays `MP4 • RU`; it opens Russian resolutions plus `Best quality`
+7. The bot's messages, controls, and errors are in Russian. When YouTube exposes a separate Russian track, it also displays `MP4 • RU`; it opens Russian resolutions plus `Лучшее качество`
 8. You tap MP4 to see ordinary quality options (1080p, 720p, etc.) or MP3 for audio
 9. `MP4 • RU` downloads only the selected Russian track and never substitutes the original audio
 10. Bot starts the download and shows real-time progress

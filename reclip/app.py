@@ -247,6 +247,14 @@ def _cleanup_job_files(job_id):
             pass
 
 
+def _cleanup_job_files_strict(job_id):
+    """Remove every job artifact or fail so cancellation can be retried."""
+    _cleanup_job_files(job_id)
+    remaining = glob.glob(os.path.join(DOWNLOAD_DIR, f"{job_id}.*"))
+    if remaining:
+        raise RuntimeError(f"Failed to remove {len(remaining)} job artifact(s)")
+
+
 def _timeout_minutes():
     minutes = JOB_TIMEOUT / 60
     return str(int(minutes)) if minutes.is_integer() else f"{minutes:g}"
@@ -265,7 +273,7 @@ def _job_stopped(job):
     return (
         job.get("status") in TERMINAL_JOB_STATUSES
         or _event_is_set(job, "_timed_out")
-        or _event_is_set(job, "_cancelled")
+        or _event_is_set(job, "_cancel_requested")
     )
 
 
@@ -281,7 +289,7 @@ def _mark_downloading(job):
 
 def _finish_error(job, message, *, error_code="download_failed"):
     with _job_lock(job):
-        if job.get("status") in TERMINAL_JOB_STATUSES:
+        if _job_stopped(job):
             return False
         job["stage"] = None
         job["error"] = message
@@ -306,21 +314,48 @@ def _finish_done(job, *, file=None, file_path=None, filename=None):
 
 
 def _finish_cancelled(job):
-    """Make cancellation terminal before stopping processes or deleting output."""
-    with _job_lock(job):
-        if job.get("status") == "cancelled":
-            return True
-        if job.get("status") in {"done", "error"}:
-            return False
-        job["_cancelled"].set()
-        job["stage"] = None
-        process = job.get("_active_process") or job.get("_process")
-        job["status"] = "cancelled"
-    if process is not None:
-        _terminate_process_group(process)
-    _cleanup_job_files(job["job_id"])
-    _log_result(job, "cancelled")
-    return True
+    """Publish cancellation only after verified, retryable teardown."""
+    with job["_cancel_lock"]:
+        with _job_lock(job):
+            if job.get("status") == "cancelled":
+                return True
+            if job.get("status") in {"done", "error"}:
+                return False
+            job["_cancel_requested"].set()
+            process = (
+                job.get("_cancel_process")
+                or job.get("_active_process")
+                or job.get("_process")
+            )
+            if process is not None:
+                job["_cancel_process"] = process
+
+        try:
+            if process is not None:
+                _terminate_process_group(process)
+                # Once termination is verified, never signal this PGID again:
+                # it could be reused before a later cleanup retry.
+                with _job_lock(job):
+                    if job.get("_cancel_process") is process:
+                        job["_cancel_process"] = None
+                    if job.get("_active_process") is process:
+                        job["_active_process"] = None
+                    if job.get("_process") is process:
+                        job["_process"] = None
+            _cleanup_job_files_strict(job["job_id"])
+        except Exception as error:
+            with _job_lock(job):
+                job["_cancel_failure"] = str(error)
+            raise
+
+        with _job_lock(job):
+            job["stage"] = None
+            job["status"] = "cancelled"
+            job["_cancelled"].set()
+            job["_cancel_failure"] = None
+            job["_cancel_process"] = None
+        _log_result(job, "cancelled")
+        return True
 
 
 def _process_group_exists(process_group_id):
@@ -362,16 +397,24 @@ def _wait_for_process_group_exit(process, timeout):
 def _terminate_process_group(process):
     try:
         os.killpg(process.pid, signal.SIGTERM)
-    except (ProcessLookupError, OSError):
+    except ProcessLookupError:
         return
+    except OSError as error:
+        if error.errno == errno.ESRCH:
+            return
+        raise
     # The leader can exit before an ffmpeg/yt-dlp descendant. Group existence,
     # not leader exit alone, decides whether escalation and cleanup are safe.
     if _wait_for_process_group_exit(process, PROCESS_GROUP_TERM_GRACE_SECONDS):
         return
     try:
         os.killpg(process.pid, signal.SIGKILL)
-    except (ProcessLookupError, OSError):
+    except ProcessLookupError:
         return
+    except OSError as error:
+        if error.errno == errno.ESRCH:
+            return
+        raise
     group_exited = _wait_for_process_group_exit(
         process, PROCESS_GROUP_KILL_TIMEOUT_SECONDS,
     )
@@ -382,17 +425,27 @@ def _terminate_process_group(process):
 def expire_job(job):
     """Stop the active process group and remove partial output at the job deadline."""
     with _job_lock(job):
-        if job.get("status") in TERMINAL_JOB_STATUSES:
+        if job.get("status") in TERMINAL_JOB_STATUSES or _event_is_set(job, "_timed_out"):
             return
-        job["_timed_out"].set()
-        stage = job.get("stage") or "downloading"
-        job["stage"] = None
-        job["error"] = (
-            f"Job timed out after {_timeout_minutes()} minutes during {stage}."
-        )
-        job["error_code"] = "job_timeout"
-        process = job.get("_active_process") or job.get("_process")
-        job["status"] = "error"
+        cancellation_pending = _event_is_set(job, "_cancel_requested")
+        if not cancellation_pending:
+            job["_timed_out"].set()
+            stage = job.get("stage") or "downloading"
+            job["stage"] = None
+            job["error"] = (
+                f"Job timed out after {_timeout_minutes()} minutes during {stage}."
+            )
+            job["error_code"] = "job_timeout"
+            process = job.get("_active_process") or job.get("_process")
+            job["status"] = "error"
+    if cancellation_pending:
+        try:
+            _finish_cancelled(job)
+        except Exception:
+            logger.exception(
+                "job_id=%s deadline_cancel_teardown_failed", job["job_id"],
+            )
+        return
     logger.info("job_id=%s deadline_exceeded stage=%s", job["job_id"], stage)
     _log_result(job, "error")
     if process is not None:
@@ -575,7 +628,7 @@ def _do_download(job_id, url, format_choice, format_id, audio_language=None, hei
                 attempt + 1,
             )
             _cleanup_job_files(job_id)
-            if job["_cancelled"].wait(delay) or job["_timed_out"].is_set():
+            if job["_cancel_requested"].wait(delay) or job["_timed_out"].is_set():
                 break
     except Exception:
         if not _job_stopped(job):
@@ -756,9 +809,13 @@ def _new_job(job_id, url, title):
         "_started_monotonic": started_monotonic,
         "_deadline_monotonic": started_monotonic + JOB_TIMEOUT,
         "_timed_out": threading.Event(),
+        "_cancel_requested": threading.Event(),
         "_cancelled": threading.Event(),
         "_lock": lock,
         "_process_lock": lock,
+        "_cancel_lock": threading.Lock(),
+        "_cancel_process": None,
+        "_cancel_failure": None,
         "_active_process": None,
         "_process": None,
     }
@@ -895,7 +952,19 @@ def cancel_job(job_id):
     job = jobs.get(job_id)
     if not job:
         return jsonify({"error": "Job not found"}), 404
-    if not _finish_cancelled(job):
+    try:
+        cancelled = _finish_cancelled(job)
+    except Exception:
+        logger.exception("job_id=%s cancellation_teardown_failed", job_id)
+        with _job_lock(job):
+            status = job["status"]
+        return jsonify({
+            "job_id": job_id,
+            "status": status,
+            "error": "Cancellation teardown failed; retry cancellation",
+            "error_code": "download_failed",
+        }), 503
+    if not cancelled:
         return jsonify({
             "job_id": job_id,
             "status": job["status"],

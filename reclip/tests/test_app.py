@@ -969,6 +969,185 @@ def test_cancel_active_job_terminates_process_group_and_cleans_files(
     assert (tmp_path / "other.mp4").exists()
 
 
+def test_cancel_teardown_failure_is_retryable_and_not_falsely_idempotent(
+    monkeypatch, tmp_path,
+):
+    process = SimpleNamespace(pid=4242)
+    job = app._new_job("job-1", "https://example.com/video", "Video")
+    job.update(status="downloading", stage="downloading", _active_process=process)
+    app.jobs["job-1"] = job
+    partial = tmp_path / "job-1.part"
+    partial.write_text("partial")
+    attempts = []
+
+    def flaky_terminate(current_process):
+        attempts.append(current_process.pid)
+        if len(attempts) == 1:
+            raise RuntimeError("process group survived SIGKILL")
+
+    monkeypatch.setattr(app, "DOWNLOAD_DIR", str(tmp_path))
+    monkeypatch.setattr(app, "_terminate_process_group", flaky_terminate)
+
+    try:
+        first = app.app.test_client().post("/api/cancel/job-1")
+        assert first.status_code == 503
+        assert first.get_json()["error_code"] == "download_failed"
+        assert job["status"] == "downloading"
+        assert job["_cancel_requested"].is_set()
+        assert job["_cancelled"].is_set() is False
+        assert partial.exists()
+        assert app._finish_error(job, "late worker failure") is False
+        assert job["status"] == "downloading"
+
+        second = app.app.test_client().post("/api/cancel/job-1")
+    finally:
+        app.jobs.pop("job-1", None)
+
+    assert second.status_code == 200
+    assert second.get_json() == {"job_id": "job-1", "status": "cancelled"}
+    assert attempts == [4242, 4242]
+    assert job["status"] == "cancelled"
+    assert not partial.exists()
+
+
+def test_job_deadline_retries_pending_cancel_teardown(monkeypatch, tmp_path):
+    process = SimpleNamespace(pid=4242)
+    job = app._new_job("job-1", "https://example.com/video", "Video")
+    job.update(status="downloading", stage="downloading", _active_process=process)
+    partial = tmp_path / "job-1.part"
+    partial.write_text("partial")
+    attempts = []
+
+    def flaky_terminate(current_process):
+        attempts.append(current_process.pid)
+        if len(attempts) == 1:
+            raise RuntimeError("process group survived SIGKILL")
+
+    monkeypatch.setattr(app, "DOWNLOAD_DIR", str(tmp_path))
+    monkeypatch.setattr(app, "_terminate_process_group", flaky_terminate)
+
+    with pytest.raises(RuntimeError):
+        app._finish_cancelled(job)
+    app.expire_job(job)
+
+    assert attempts == [4242, 4242]
+    assert job["status"] == "cancelled"
+    assert not partial.exists()
+
+
+def test_cancel_cleanup_failure_is_retryable_before_cancelled_is_published(
+    monkeypatch, tmp_path,
+):
+    process = SimpleNamespace(pid=4242)
+    job = app._new_job("job-1", "https://example.com/video", "Video")
+    job.update(status="downloading", stage="downloading", _active_process=process)
+    app.jobs["job-1"] = job
+    partial = tmp_path / "job-1.part"
+    partial.write_text("partial")
+    original_remove = app.os.remove
+    remove_attempts = []
+    termination_attempts = []
+
+    def flaky_remove(path):
+        remove_attempts.append(path)
+        if len(remove_attempts) == 1:
+            raise PermissionError("file is still in use")
+        original_remove(path)
+
+    def record_termination(current_process):
+        termination_attempts.append(current_process.pid)
+
+    monkeypatch.setattr(app, "DOWNLOAD_DIR", str(tmp_path))
+    monkeypatch.setattr(app.os, "remove", flaky_remove)
+    monkeypatch.setattr(app, "_terminate_process_group", record_termination)
+
+    try:
+        first = app.app.test_client().post("/api/cancel/job-1")
+        assert first.status_code == 503
+        assert job["status"] == "downloading"
+        assert partial.exists()
+
+        second = app.app.test_client().post("/api/cancel/job-1")
+    finally:
+        app.jobs.pop("job-1", None)
+
+    assert second.status_code == 200
+    assert job["status"] == "cancelled"
+    assert len(remove_attempts) == 2
+    assert termination_attempts == [4242]
+    assert not partial.exists()
+
+
+def test_retrying_failed_cancel_unblocks_worker_and_releases_slot_once(monkeypatch):
+    process = SimpleNamespace(pid=4242)
+    job = app._new_job("job-1", "https://example.com/video", "Video")
+    app.jobs["job-1"] = job
+    process_ready = app.threading.Event()
+    process_stopped = app.threading.Event()
+    releases = []
+    termination_attempts = []
+
+    class Semaphore:
+        def acquire(self, timeout):
+            return True
+
+        def release(self):
+            releases.append("released")
+
+    def blocked_download(*args):
+        with app._job_lock(job):
+            job["_active_process"] = process
+            job["_process"] = process
+        process_ready.set()
+        assert process_stopped.wait(timeout=2)
+
+    def flaky_terminate(current_process):
+        termination_attempts.append(current_process.pid)
+        if len(termination_attempts) == 1:
+            raise RuntimeError("termination could not be verified")
+        process_stopped.set()
+
+    monkeypatch.setattr(app, "download_semaphore", Semaphore())
+    monkeypatch.setattr(app, "_do_download", blocked_download)
+    monkeypatch.setattr(app, "_terminate_process_group", flaky_terminate)
+    worker = app.threading.Thread(
+        target=app.run_download,
+        args=("job-1", "https://example.com/video", "video", None),
+    )
+    worker.start()
+
+    try:
+        assert process_ready.wait(timeout=1)
+        first = app.app.test_client().post("/api/cancel/job-1")
+        assert first.status_code == 503
+        assert releases == []
+
+        second = app.app.test_client().post("/api/cancel/job-1")
+        worker.join(timeout=1)
+    finally:
+        process_stopped.set()
+        worker.join(timeout=1)
+        app.jobs.pop("job-1", None)
+
+    assert second.status_code == 200
+    assert worker.is_alive() is False
+    assert termination_attempts == [4242, 4242]
+    assert releases == ["released"]
+    assert job["status"] == "cancelled"
+
+
+def test_terminate_process_group_does_not_treat_permission_error_as_success(monkeypatch):
+    process = SimpleNamespace(pid=4242)
+
+    def permission_error(pid, sig):
+        raise PermissionError("not permitted")
+
+    monkeypatch.setattr(app.os, "killpg", permission_error)
+
+    with pytest.raises(PermissionError):
+        app._terminate_process_group(process)
+
+
 def test_cancelled_job_cannot_start_a_later_process(monkeypatch):
     job = app._new_job("job-1", "https://example.com/video", "Video")
     app._finish_cancelled(job)

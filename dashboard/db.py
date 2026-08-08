@@ -148,7 +148,7 @@ async def update_download_error(*, job_id: str, error_message: str) -> None:
             """
             UPDATE downloads
             SET status='error', error_message=?, completed_at=?
-            WHERE job_id=?
+            WHERE job_id=? AND status <> 'cancelled'
             """,
             (error_message, completed_at, job_id),
         )

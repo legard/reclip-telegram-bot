@@ -20,11 +20,31 @@ def test_build_application_enables_local_mode():
     assert application.bot.base_file_url == "http://telegram-bot-api:8081/file/bot123456:test-token"
 
 
+def test_build_application_processes_callbacks_while_multi_url_metadata_is_pending():
+    application = bot.build_application("123456:test-token", "http://telegram-bot-api:8081")
+
+    assert application.update_processor.max_concurrent_updates > 1
+
+
 def test_parse_allowed_user_ids_rejects_empty_and_invalid_values():
     with pytest.raises(ValueError):
         bot.parse_allowed_user_ids("")
     with pytest.raises(ValueError):
         bot.parse_allowed_user_ids("12,nope")
+
+
+def test_bot_command_descriptions_are_russian():
+    commands = bot.bot_commands()
+
+    assert [command.command for command in commands] == [
+        "start", "help", "mp3", "mp4", "best", "platforms",
+        "settings", "setquality", "setformat", "stats",
+    ]
+    assert all(
+        any("а" <= character.lower() <= "я" or character.lower() == "ё"
+            for character in command.description)
+        for command in commands
+    )
 
 
 def test_allowed_user_filter_matches_only_configured_user_ids():

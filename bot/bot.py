@@ -71,8 +71,26 @@ def build_application(bot_token: str, api_url: str):
         .read_timeout(60)
         .write_timeout(60)
         .connect_timeout(30)
+        .concurrent_updates(True)
         .build()
     )
+
+
+def bot_commands():
+    from telegram import BotCommand
+
+    return [
+        BotCommand("start", "Запустить бота"),
+        BotCommand("help", "Помощь и команды"),
+        BotCommand("mp3", "Скачать в MP3"),
+        BotCommand("mp4", "Скачать MP4 в лучшем качестве"),
+        BotCommand("best", "Лучшее доступное качество"),
+        BotCommand("platforms", "Поддерживаемые сайты"),
+        BotCommand("settings", "Ваши настройки"),
+        BotCommand("setquality", "Задать качество по умолчанию"),
+        BotCommand("setformat", "Задать формат по умолчанию"),
+        BotCommand("stats", "Статистика бота"),
+    ]
 
 
 def main():
@@ -102,19 +120,7 @@ def main():
     async def post_init(application):
         await preference_store.initialize()
         asyncio.create_task(cleanup_loop())
-        from telegram import BotCommand
-        await application.bot.set_my_commands([
-            BotCommand("start", "Start the bot"),
-            BotCommand("help", "Help and commands"),
-            BotCommand("mp3", "Download as MP3"),
-            BotCommand("mp4", "Download best quality MP4"),
-            BotCommand("best", "Best available quality"),
-            BotCommand("platforms", "Supported platforms"),
-            BotCommand("settings", "Your preferences"),
-            BotCommand("setquality", "Set default quality"),
-            BotCommand("setformat", "Set default format"),
-            BotCommand("stats", "Bot statistics"),
-        ])
+        await application.bot.set_my_commands(bot_commands())
         logger.info("Bot commands registered")
 
     app.post_init = post_init

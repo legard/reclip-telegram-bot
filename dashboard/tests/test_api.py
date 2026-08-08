@@ -160,6 +160,33 @@ def test_cancelled_event_persists_status_removes_active_download_and_does_not_ad
     assert asyncio.run(db.get_dashboard_stats())["errors_today"] == before_errors
 
 
+def test_cancelled_dashboard_row_ignores_late_error_event():
+    job_id = "job-cancelled-late-error"
+    client.post("/api/events", json={
+        "type": "download_start",
+        "job_id": job_id,
+        "user_id": 5,
+        "chat_id": 5,
+        "url": "https://example.com/cancelled-late.mp4",
+    })
+    client.post("/api/events", json={
+        "type": "download_cancelled", "job_id": job_id,
+    })
+    before_errors = asyncio.run(db.get_dashboard_stats())["errors_today"]
+
+    response = client.post("/api/events", json={
+        "type": "download_error",
+        "job_id": job_id,
+        "error_message": "late stale poll failure",
+    })
+
+    row = asyncio.run(db.get_download_by_job_id(job_id))
+    assert response.status_code == 200
+    assert row["status"] == "cancelled"
+    assert row["error_message"] is None
+    assert asyncio.run(db.get_dashboard_stats())["errors_today"] == before_errors
+
+
 # ---------------------------------------------------------------------------
 # Auth: dashboard-stats
 # ---------------------------------------------------------------------------

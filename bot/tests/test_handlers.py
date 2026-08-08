@@ -23,15 +23,17 @@ def button_callbacks(markup):
 
 
 class FakeQuery:
-    def __init__(self, *, data, chat_id, message_id, photo=False):
+    def __init__(self, *, data, chat_id, message_id, photo=False, user_id=42):
         self.data = data
         self.message = SimpleNamespace(chat_id=chat_id, message_id=message_id, photo=photo)
+        self.from_user = SimpleNamespace(id=user_id)
         self.reply_markup = None
         self.edited_text = None
         self.edited_caption = None
+        self.answer_count = 0
 
     async def answer(self):
-        pass
+        self.answer_count += 1
 
     async def edit_message_reply_markup(self, *, reply_markup):
         self.reply_markup = reply_markup
@@ -49,6 +51,50 @@ class FakeUpdate:
     def __init__(self, query, user_id=42):
         self.callback_query = query
         self.effective_user = SimpleNamespace(id=user_id)
+        query.from_user = self.effective_user
+
+
+class SharedMessage:
+    photo = False
+
+    def __init__(self, *, chat_id=10, message_id=7):
+        self.chat_id = chat_id
+        self.message_id = message_id
+        self.chat = object()
+        self.text = None
+        self.reply_markup = None
+        self.edits = []
+
+    async def edit_text(self, text, **kwargs):
+        self.text = text
+        self.reply_markup = kwargs.get("reply_markup", self.reply_markup)
+        self.edits.append((text, self.reply_markup))
+
+    async def edit_reply_markup(self, *, reply_markup):
+        self.reply_markup = reply_markup
+
+    async def delete(self):
+        pass
+
+
+class SharedQuery:
+    def __init__(self, message, *, data="cancel:7:abcd", user_id=42):
+        self.message = message
+        self.data = data
+        self.from_user = SimpleNamespace(id=user_id)
+        self.answer_count = 0
+
+    async def answer(self):
+        self.answer_count += 1
+
+    async def edit_message_text(self, text, **kwargs):
+        await self.message.edit_text(text, **kwargs)
+
+    async def edit_message_caption(self, caption, **kwargs):
+        await self.message.edit_text(caption, **kwargs)
+
+    async def edit_message_reply_markup(self, *, reply_markup):
+        await self.message.edit_reply_markup(reply_markup=reply_markup)
 
 
 @pytest.fixture(autouse=True)
@@ -76,25 +122,29 @@ async def test_wait_helper_edits_only_when_download_stage_or_progress_changes(mo
     statuses = [
         {"status": "downloading", "stage": "downloading", "progress": {"percent": 10}},
         {"status": "downloading", "stage": "downloading", "progress": {"percent": 10}},
-        {"status": "downloading", "stage": "postprocessing", "progress": {"percent": 10}},
+        {"status": "postprocessing", "stage": "postprocessing", "progress": {"percent": 10}},
         {"status": "done", "file_path": "/downloads/video.mp4"},
     ]
+    progress_events = []
 
     async def fake_wait_for_job(job_id, on_status):
         for status in statuses:
             await on_status(status)
         return statuses[-1]
 
-    async def ignore_progress(**kwargs):
-        pass
+    async def capture_progress(**kwargs):
+        progress_events.append(kwargs)
 
     monkeypatch.setattr(handlers, "wait_for_job", fake_wait_for_job)
-    monkeypatch.setattr(handlers.event_client, "send_progress", ignore_progress)
+    monkeypatch.setattr(handlers.event_client, "send_progress", capture_progress)
 
     result = await handlers._wait_for_download_job("job-1", message)
 
     assert result["status"] == "done"
     assert message.edits == ["Загрузка: 10%", "Обработка файла…"]
+    assert [event["stage"] for event in progress_events] == [
+        "downloading", "downloading", "postprocessing",
+    ]
 
 
 @pytest.mark.asyncio
@@ -177,7 +227,9 @@ def test_russian_quality_buttons_store_height_not_format_id():
 
 
 def test_quality_buttons_include_cancel():
-    markup = handlers._build_quality_buttons(7, "abcd", [{"id": "22", "label": "720p"}])
+    markup = handlers._build_quality_buttons(
+        7, "abcd", [{"id": "22", "label": "720p", "height": 720}],
+    )
 
     assert button_callbacks(markup) == [
         "qty:7:abcd:22", "qty:7:abcd:best", "fmt:7:abcd:back", "cancel:7:abcd",
@@ -186,7 +238,9 @@ def test_quality_buttons_include_cancel():
 
 
 def test_quality_menus_offer_russian_back_navigation():
-    normal = handlers._build_quality_buttons(7, "abcd", [{"id": "22", "label": "720p"}])
+    normal = handlers._build_quality_buttons(
+        7, "abcd", [{"id": "22", "label": "720p", "height": 720}],
+    )
     russian = handlers._build_russian_quality_buttons(7, "abcd", [{"height": 720, "label": "720p"}])
 
     assert "Назад" in button_texts(normal)
@@ -228,10 +282,50 @@ async def test_retry_refetches_info_and_resolves_current_semantic_height(monkeyp
         "format": "video", "format_id": "new-360",
         "audio_language": None, "height": None,
     }
+    assert handlers._state[entry["state_key"]] is entry
+    assert entry["user_id"] == 42
+    assert entry["cancel_callback_data"] == "cancel:7:2f0683ba"
 
     await handlers.retry_callback(FakeUpdate(query), None)
     await asyncio.sleep(0)
     assert len(started) == 1
+
+
+@pytest.mark.asyncio
+async def test_retry_honors_ru_if_available_when_track_is_currently_available(monkeypatch):
+    token = handlers._retry_store.put({
+        "url": "https://youtu.be/x", "format": "video", "quality": "480",
+        "audio_mode": "ru_if_available", "user_id": 42,
+    })
+    query = FakeQuery(data=f"retry:{token}", chat_id=10, message_id=7)
+    started = []
+
+    async def fresh_info(url):
+        return {
+            "title": "Video",
+            "formats": [{"id": "normal-480", "height": 480}],
+            "russian_audio": {
+                "available": True,
+                "formats": [
+                    {"height": 720, "label": "720p"},
+                    {"height": 360, "label": "360p"},
+                ],
+            },
+        }
+
+    async def capture_download(query_arg, entry, **kwargs):
+        started.append(kwargs)
+
+    monkeypatch.setattr(handlers, "get_info", fresh_info)
+    monkeypatch.setattr(handlers, "download_and_send", capture_download)
+
+    await handlers.retry_callback(FakeUpdate(query), None)
+    await asyncio.sleep(0)
+
+    assert started == [{
+        "format": "video", "format_id": None,
+        "audio_language": "ru", "height": 360,
+    }]
 
 
 @pytest.mark.asyncio
@@ -262,7 +356,7 @@ async def test_non_owner_retry_callback_cannot_consume_the_owners_token(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_url_metadata_failure_offers_semantic_retry_with_default_intent(monkeypatch):
+async def test_first_metadata_retry_returns_to_manual_picker_without_autodownload(monkeypatch):
     class StatusMessage:
         photo = False
         message_id = 7
@@ -281,10 +375,26 @@ async def test_url_metadata_failure_offers_semantic_retry_with_default_intent(mo
         async def reply_text(self, text, **kwargs):
             return status
 
-    async def unavailable(url):
-        raise ReclipInfoError("backend timeout", error_code="network")
+    info_calls = 0
 
-    monkeypatch.setattr(handlers, "get_info", unavailable)
+    async def unavailable_then_fresh(url):
+        nonlocal info_calls
+        info_calls += 1
+        if info_calls == 1:
+            raise ReclipInfoError("backend timeout", error_code="network")
+        return {
+            "title": "Video",
+            "formats": [{"id": "22", "height": 720, "label": "720p"}],
+            "russian_audio": {"available": False, "formats": []},
+        }
+
+    started = []
+
+    async def capture_download(*args, **kwargs):
+        started.append((args, kwargs))
+
+    monkeypatch.setattr(handlers, "get_info", unavailable_then_fresh)
+    monkeypatch.setattr(handlers, "download_and_send", capture_download)
     update = SimpleNamespace(
         message=Message(), effective_user=SimpleNamespace(id=42), effective_chat=SimpleNamespace(id=10),
     )
@@ -294,10 +404,18 @@ async def test_url_metadata_failure_offers_semantic_retry_with_default_intent(mo
     text, kwargs = status.edits[-1]
     assert text == "Не удалось загрузить файл. Попробуйте ещё раз."
     token = button_callbacks(kwargs["reply_markup"])[0].removeprefix("retry:")
-    assert handlers._retry_store.get(token) == {
-        "url": "https://youtu.be/x", "format": "video", "quality": "best",
-        "audio_mode": "original", "user_id": 42,
-    }
+    query = FakeQuery(data=f"retry:{token}", chat_id=10, message_id=7)
+
+    await handlers.retry_callback(FakeUpdate(query), None)
+    await asyncio.sleep(0)
+
+    assert started == []
+    assert button_callbacks(query.reply_markup) == [
+        "fmt:7:2f0683ba:video", "fmt:7:2f0683ba:audio", "cancel:7:2f0683ba",
+    ]
+    key = handlers._state_key(10, 7, "2f0683ba")
+    assert handlers._state[key]["user_id"] == 42
+    assert handlers._state[key]["url"] == "https://youtu.be/x"
 
 
 @pytest.mark.asyncio
@@ -358,12 +476,39 @@ def test_download_intent_uses_available_russian_audio_or_notes_original_fallback
     assert handlers._download_intent("video", "480", "ru_if_available", info_with_russian) == {
         "format": "video", "format_id": None, "audio_language": "ru", "height": 360,
     }
-    assert handlers._download_intent("video", "480", "ru_if_available", {"formats": [{"height": 720}]}) == {
-        "format": "video", "format_id": None, "audio_language": None, "height": 720,
+    assert handlers._download_intent(
+        "video", "480", "ru_if_available",
+        {"formats": [{"id": "normal-720", "height": 720}]},
+    ) == {
+        "format": "video", "format_id": "normal-720", "audio_language": None, "height": None,
         "fallback_note": "Русская дорожка недоступна — скачиваем оригинал.",
     }
     assert handlers._download_intent("audio", "720", "original", info_with_russian) == {
         "format": "audio", "format_id": None, "audio_language": None, "height": None,
+    }
+
+
+@pytest.mark.parametrize(
+    ("quality", "formats", "expected_format_id"),
+    [
+        ("720", [{"id": "1080", "height": 1080}, {"id": "720", "height": 720}], "720"),
+        ("720", [{"id": "1080", "height": 1080}, {"id": "480", "height": 480}], "480"),
+        ("480", [{"id": "1080", "height": 1080}, {"id": "720", "height": 720}], "720"),
+        ("best", [{"id": "1080", "height": 1080}], None),
+    ],
+)
+def test_saved_fixed_video_intent_resolves_current_format_id(
+    quality, formats, expected_format_id,
+):
+    intent = handlers._download_intent(
+        "video", quality, "original", {"formats": formats},
+    )
+
+    assert intent == {
+        "format": "video",
+        "format_id": expected_format_id,
+        "audio_language": None,
+        "height": None,
     }
 
 
@@ -416,7 +561,7 @@ async def test_first_russian_mp4_choice_saves_soft_future_audio_mode(tmp_path, m
 
 
 @pytest.mark.asyncio
-async def test_high_russian_height_starts_strict_download_and_saves_best_semantic_quality(
+async def test_russian_quality_callback_rejects_non_persistable_height(
     tmp_path, monkeypatch,
 ):
     store = PreferenceStore(str(tmp_path / "bot.db"))
@@ -437,18 +582,17 @@ async def test_high_russian_height_starts_strict_download_and_saves_best_semanti
     await handlers.russian_quality_callback(FakeUpdate(query), None, store)
     await asyncio.sleep(0)
 
-    assert calls == [{
-        "format": "video", "format_id": None,
-        "audio_language": "ru", "height": 2160,
-    }]
-    assert await store.get(42) == {
-        "format": "video", "quality": "best", "audio_mode": "ru_if_available",
-    }
-    assert entry["retry_intent"]["quality"] == "2160"
+    assert calls == []
+    assert await store.get(42) is None
+    assert entry.get("selection_started") is not True
+    assert query.edited_text == "Время выбора истекло. Отправьте ссылку ещё раз."
+    assert query.reply_markup is None
 
 
 @pytest.mark.asyncio
-async def test_high_normal_quality_keeps_raw_height_for_semantic_retry(monkeypatch):
+async def test_normal_quality_callback_rejects_non_persistable_height(tmp_path, monkeypatch):
+    store = PreferenceStore(str(tmp_path / "bot.db"))
+    await store.initialize()
     entry = {
         "url": "https://youtu.be/x",
         "info": {"title": "Video", "formats": [{"id": "high-id", "height": 1440}]},
@@ -462,10 +606,35 @@ async def test_high_normal_quality_keeps_raw_height_for_semantic_retry(monkeypat
 
     monkeypatch.setattr(handlers, "download_and_send", ignore_download)
 
-    await handlers.quality_callback(FakeUpdate(query), None)
+    await handlers.quality_callback(FakeUpdate(query), None, store)
     await asyncio.sleep(0)
 
-    assert entry["retry_intent"]["quality"] == "1440"
+    assert await store.get(42) is None
+    assert entry.get("selection_started") is not True
+    assert query.edited_text == "Время выбора истекло. Отправьте ссылку ещё раз."
+    assert query.reply_markup is None
+
+
+def test_manual_picker_only_offers_persistable_qualities():
+    normal = handlers._build_quality_buttons(7, "abcd", [
+        {"id": "high", "height": 1440, "label": "1440p"},
+        {"id": "1080", "height": 1080, "label": "1080p"},
+        {"id": "odd", "height": 540, "label": "540p"},
+        {"id": "480", "height": 480, "label": "480p"},
+    ])
+    russian = handlers._build_russian_quality_buttons(7, "abcd", [
+        {"height": 2160, "label": "2160p"},
+        {"height": 720, "label": "720p"},
+        {"height": 540, "label": "540p"},
+        {"height": 360, "label": "360p"},
+    ])
+
+    assert button_texts(normal) == [
+        "1080p", "480p", "Лучшее качество", "Назад", "Отменить",
+    ]
+    assert button_texts(russian) == [
+        "720p", "360p", "Лучшее качество", "Назад", "Отменить",
+    ]
 
 
 @pytest.mark.asyncio
@@ -506,7 +675,9 @@ async def test_download_start_keeps_russian_audio_fallback_note_visible(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_saved_preferences_auto_start_semantic_download_without_session(monkeypatch, tmp_path):
+async def test_saved_preferences_auto_start_with_fresh_quality_and_cancellable_state(
+    monkeypatch, tmp_path,
+):
     store = PreferenceStore(str(tmp_path / "bot.db"))
     await store.initialize()
     await store.save(42, format="video", quality="480", audio_mode="ru_if_available")
@@ -514,6 +685,7 @@ async def test_saved_preferences_auto_start_semantic_download_without_session(mo
 
     class StatusMessage:
         message_id = 7
+        chat_id = 10
         chat = object()
         photo = False
 
@@ -533,7 +705,10 @@ async def test_saved_preferences_auto_start_semantic_download_without_session(mo
     )
 
     async def fake_info(url):
-        return {"title": "Video", "formats": [{"height": 720}]}
+        return {
+            "title": "Video",
+            "formats": [{"id": "fresh-720", "height": 720}],
+        }
 
     async def fake_download(query, entry, **kwargs):
         started.append((entry, kwargs))
@@ -545,16 +720,99 @@ async def test_saved_preferences_auto_start_semantic_download_without_session(mo
     await asyncio.sleep(0)
 
     assert started[0][1] == {
-        "format": "video", "format_id": None, "audio_language": None, "height": 720,
+        "format": "video", "format_id": "fresh-720", "audio_language": None, "height": None,
         "start_note": "Русская дорожка недоступна — скачиваем оригинал.",
     }
-    assert handlers._state == {}
+    entry = started[0][0]
+    assert handlers._state[entry["state_key"]] is entry
+    assert entry["user_id"] == 42
+    assert entry["cancel_callback_data"] == "cancel:7:2f0683ba"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fmt", ["audio", "video"])
+async def test_direct_download_registers_owner_bound_cancellable_state(monkeypatch, fmt):
+    class StatusMessage:
+        message_id = 7
+        chat_id = 10
+        chat = object()
+        photo = False
+
+        async def edit_text(self, text, **kwargs):
+            pass
+
+    status = StatusMessage()
+    update = SimpleNamespace(effective_user=SimpleNamespace(id=42))
+    started = []
+
+    async def fake_info(url):
+        return {"title": "Video", "formats": []}
+
+    async def capture_download(query, entry, **kwargs):
+        started.append((entry, kwargs))
+
+    monkeypatch.setattr(handlers, "get_info", fake_info)
+    monkeypatch.setattr(handlers, "download_and_send", capture_download)
+
+    await handlers._direct_download(
+        update, status, "https://youtu.be/x", fmt, None,
+    )
+    await asyncio.sleep(0)
+
+    entry, intent = started[0]
+    assert intent == {"format": fmt, "format_id": None}
+    assert handlers._state[entry["state_key"]] is entry
+    assert entry["user_id"] == 42
+    assert entry["selection_started"] is True
+    assert entry["cancel_callback_data"] == "cancel:7:2f0683ba"
+
+
+@pytest.mark.asyncio
+async def test_direct_download_releases_update_loop_while_lifecycle_remains_active(monkeypatch):
+    class StatusMessage:
+        message_id = 7
+        chat_id = 10
+        chat = object()
+        photo = False
+
+        async def edit_text(self, text, **kwargs):
+            pass
+
+    lifecycle_started = asyncio.Event()
+    finish_lifecycle = asyncio.Event()
+
+    async def fake_info(url):
+        return {"title": "Video", "formats": []}
+
+    async def pending_download(query, entry, **kwargs):
+        lifecycle_started.set()
+        await finish_lifecycle.wait()
+
+    monkeypatch.setattr(handlers, "get_info", fake_info)
+    monkeypatch.setattr(handlers, "download_and_send", pending_download)
+    direct_task = asyncio.create_task(handlers._direct_download(
+        SimpleNamespace(effective_user=SimpleNamespace(id=42)),
+        StatusMessage(),
+        "https://youtu.be/x",
+        "video",
+        None,
+    ))
+
+    await lifecycle_started.wait()
+    await asyncio.sleep(0)
+
+    assert direct_task.done() is True
+    entry = next(iter(handlers._state.values()))
+    assert entry["cancel_callback_data"] == "cancel:7:2f0683ba"
+
+    finish_lifecycle.set()
+    await asyncio.sleep(0)
 
 
 @pytest.mark.asyncio
 async def test_cancel_removes_session_and_replaces_text_card():
     key = handlers._state_key(10, 7, "abcd")
-    handlers._state[key] = {"created": time.time()}
+    handlers._state[key] = {"created": time.time(), "user_id": 42}
     query = FakeQuery(data="cancel:7:abcd", chat_id=10, message_id=7)
 
     await handlers.cancel_callback(FakeUpdate(query), None)
@@ -567,7 +825,7 @@ async def test_cancel_removes_session_and_replaces_text_card():
 @pytest.mark.asyncio
 async def test_cancel_removes_session_and_replaces_photo_caption():
     key = handlers._state_key(10, 7, "abcd")
-    handlers._state[key] = {"created": time.time()}
+    handlers._state[key] = {"created": time.time(), "user_id": 42}
     query = FakeQuery(data="cancel:7:abcd", chat_id=10, message_id=7, photo=True)
 
     await handlers.cancel_callback(FakeUpdate(query), None)
@@ -581,7 +839,8 @@ async def test_cancel_removes_session_and_replaces_photo_caption():
 async def test_active_job_cancel_calls_reclip_and_reports_cancelled(monkeypatch):
     key = handlers._state_key(10, 7, "abcd")
     handlers._state[key] = {
-        "created": time.time(), "job_id": "job-1", "upload_started": False,
+        "created": time.time(), "user_id": 42,
+        "job_id": "job-1", "upload_started": False,
     }
     query = FakeQuery(data="cancel:7:abcd", chat_id=10, message_id=7)
     cancelled_job_ids = []
@@ -611,6 +870,7 @@ async def test_active_job_cancel_remains_available_after_selection_ttl(monkeypat
     handlers._state[key] = {
         "created": time.time() - handlers.STATE_TTL - 1,
         "selection_started": True,
+        "user_id": 42,
         "job_id": "job-1",
         "upload_started": False,
     }
@@ -667,6 +927,7 @@ async def test_stale_progress_after_successful_cancel_does_not_restore_cancel_bu
     entry = {
         "created": time.time(),
         "selection_started": True,
+        "user_id": 42,
         "job_id": "job-1",
         "cancel_callback_data": "cancel:7:abcd",
     }
@@ -703,7 +964,308 @@ async def test_stale_progress_after_successful_cancel_does_not_restore_cancel_bu
 
 
 @pytest.mark.asyncio
-async def test_pre_job_cancel_terminal_conflict_continues_normal_completion(monkeypatch, tmp_path):
+async def test_in_flight_progress_edit_cannot_overwrite_cancelled_card(monkeypatch):
+    class BlockingMessage(SharedMessage):
+        def __init__(self):
+            super().__init__()
+            self.progress_edit_started = asyncio.Event()
+            self.release_progress_edit = asyncio.Event()
+
+        async def edit_text(self, text, **kwargs):
+            if text.startswith("Загрузка"):
+                self.progress_edit_started.set()
+                await self.release_progress_edit.wait()
+            await super().edit_text(text, **kwargs)
+
+    message = BlockingMessage()
+    query = SharedQuery(message)
+    key = handlers._state_key(10, 7, "abcd")
+    entry = {
+        "created": time.time(),
+        "selection_started": True,
+        "user_id": 42,
+        "job_id": "job-1",
+        "state_key": key,
+        "cancel_callback_data": "cancel:7:abcd",
+    }
+    handlers._state[key] = entry
+
+    async def fake_wait_for_job(job_id, on_status):
+        await on_status({"status": "downloading", "progress": {"percent": 10}})
+        return {"status": "cancelled"}
+
+    async def cancel_reclip(job_id):
+        return {"job_id": job_id, "status": "cancelled"}
+
+    async def ignore_event(**kwargs):
+        pass
+
+    monkeypatch.setattr(handlers, "wait_for_job", fake_wait_for_job)
+    monkeypatch.setattr(handlers, "cancel_download", cancel_reclip)
+    monkeypatch.setattr(handlers.event_client, "send_download_cancelled", ignore_event)
+    monkeypatch.setattr(handlers.event_client, "send_progress", ignore_event)
+
+    wait_task = asyncio.create_task(
+        handlers._wait_for_download_job("job-1", message, entry)
+    )
+    await message.progress_edit_started.wait()
+    cancel_task = asyncio.create_task(handlers.cancel_callback(FakeUpdate(query), None))
+    await asyncio.sleep(0)
+    message.release_progress_edit.set()
+    await asyncio.gather(wait_task, cancel_task)
+
+    assert message.text == "Отменено."
+    assert message.reply_markup is None
+
+
+@pytest.mark.asyncio
+async def test_successful_cancel_wins_over_late_wait_error(monkeypatch):
+    message = SharedMessage()
+    query = SharedQuery(message)
+    key = handlers._state_key(10, 7, "abcd")
+    entry = {
+        "url": "https://youtu.be/x",
+        "info": {"title": "Video", "extractor": "youtube"},
+        "created": time.time(),
+        "user_id": 42,
+        "state_key": key,
+        "selection_started": True,
+        "cancel_callback_data": "cancel:7:abcd",
+    }
+    handlers._state[key] = entry
+    wait_started = asyncio.Event()
+    release_wait = asyncio.Event()
+    cancelled_events = []
+    error_events = []
+
+    async def fake_start(*args, **kwargs):
+        return "job-1"
+
+    async def late_wait_error(*args, **kwargs):
+        wait_started.set()
+        await release_wait.wait()
+        raise ReclipDownloadError("stale poll failed", error_code="network")
+
+    async def cancel_reclip(job_id):
+        return {"job_id": job_id, "status": "cancelled"}
+
+    async def ignore_start(**kwargs):
+        pass
+
+    async def record_cancelled(*, job_id):
+        cancelled_events.append(job_id)
+
+    async def record_error(**kwargs):
+        error_events.append(kwargs)
+
+    monkeypatch.setattr(handlers, "start_download", fake_start)
+    monkeypatch.setattr(handlers, "_wait_for_download_job", late_wait_error)
+    monkeypatch.setattr(handlers, "cancel_download", cancel_reclip)
+    monkeypatch.setattr(handlers.event_client, "send_download_start", ignore_start)
+    monkeypatch.setattr(handlers.event_client, "send_download_cancelled", record_cancelled)
+    monkeypatch.setattr(handlers.event_client, "send_download_error", record_error)
+
+    download_task = asyncio.create_task(handlers.download_and_send(
+        SimpleNamespace(message=message), entry, format="video", format_id=None,
+    ))
+    await wait_started.wait()
+    await handlers.cancel_callback(FakeUpdate(query), None)
+    release_wait.set()
+    await download_task
+
+    assert message.text == "Отменено."
+    assert message.reply_markup is None
+    assert cancelled_events == ["job-1"]
+    assert error_events == []
+    assert key not in handlers._state
+
+
+@pytest.mark.asyncio
+async def test_in_flight_cancel_wins_before_poll_error_can_publish(monkeypatch):
+    message = SharedMessage()
+    query = SharedQuery(message)
+    key = handlers._state_key(10, 7, "abcd")
+    entry = {
+        "url": "https://youtu.be/x",
+        "info": {"title": "Video", "extractor": "youtube"},
+        "created": time.time(),
+        "user_id": 42,
+        "state_key": key,
+        "selection_started": True,
+        "cancel_callback_data": "cancel:7:abcd",
+    }
+    handlers._state[key] = entry
+    wait_started = asyncio.Event()
+    release_poll_error = asyncio.Event()
+    cancel_started = asyncio.Event()
+    release_cancel = asyncio.Event()
+    cancelled_events = []
+    error_events = []
+
+    async def fake_start(*args, **kwargs):
+        return "job-1"
+
+    async def poll_error(*args, **kwargs):
+        wait_started.set()
+        await release_poll_error.wait()
+        raise ReclipDownloadError("poll failed", error_code="network")
+
+    async def delayed_cancel(job_id):
+        cancel_started.set()
+        await release_cancel.wait()
+        return {"job_id": job_id, "status": "cancelled"}
+
+    async def ignore_start(**kwargs):
+        pass
+
+    async def record_cancelled(*, job_id):
+        cancelled_events.append(job_id)
+
+    async def record_error(**kwargs):
+        error_events.append(kwargs)
+
+    monkeypatch.setattr(handlers, "start_download", fake_start)
+    monkeypatch.setattr(handlers, "_wait_for_download_job", poll_error)
+    monkeypatch.setattr(handlers, "cancel_download", delayed_cancel)
+    monkeypatch.setattr(handlers.event_client, "send_download_start", ignore_start)
+    monkeypatch.setattr(handlers.event_client, "send_download_cancelled", record_cancelled)
+    monkeypatch.setattr(handlers.event_client, "send_download_error", record_error)
+
+    download_task = asyncio.create_task(handlers.download_and_send(
+        SimpleNamespace(message=message), entry, format="video", format_id=None,
+    ))
+    await wait_started.wait()
+    cancel_task = asyncio.create_task(handlers.cancel_callback(FakeUpdate(query), None))
+    await cancel_started.wait()
+    release_poll_error.set()
+    await asyncio.sleep(0)
+    release_cancel.set()
+    await asyncio.gather(download_task, cancel_task)
+
+    assert message.text == "Отменено."
+    assert cancelled_events == ["job-1"]
+    assert error_events == []
+    assert key not in handlers._state
+
+
+@pytest.mark.asyncio
+async def test_lost_cancel_response_is_reconciled_by_polled_cancelled_status(monkeypatch):
+    message = SharedMessage()
+    query = SharedQuery(message)
+    key = handlers._state_key(10, 7, "abcd")
+    entry = {
+        "url": "https://youtu.be/x",
+        "info": {"title": "Video", "extractor": "youtube"},
+        "created": time.time(),
+        "user_id": 42,
+        "state_key": key,
+        "selection_started": True,
+        "cancel_callback_data": "cancel:7:abcd",
+    }
+    handlers._state[key] = entry
+    wait_started = asyncio.Event()
+    release_wait = asyncio.Event()
+    cancelled_events = []
+    error_events = []
+
+    async def fake_start(*args, **kwargs):
+        return "job-1"
+
+    async def cancelled_status(*args, **kwargs):
+        wait_started.set()
+        await release_wait.wait()
+        return {"status": "cancelled"}
+
+    async def lost_response(job_id):
+        raise ReclipDownloadError("response lost", error_code="network")
+
+    async def ignore_start(**kwargs):
+        pass
+
+    async def record_cancelled(*, job_id):
+        cancelled_events.append(job_id)
+
+    async def record_error(**kwargs):
+        error_events.append(kwargs)
+
+    monkeypatch.setattr(handlers, "start_download", fake_start)
+    monkeypatch.setattr(handlers, "_wait_for_download_job", cancelled_status)
+    monkeypatch.setattr(handlers, "cancel_download", lost_response)
+    monkeypatch.setattr(handlers.event_client, "send_download_start", ignore_start)
+    monkeypatch.setattr(handlers.event_client, "send_download_cancelled", record_cancelled)
+    monkeypatch.setattr(handlers.event_client, "send_download_error", record_error)
+
+    download_task = asyncio.create_task(handlers.download_and_send(
+        SimpleNamespace(message=message), entry, format="video", format_id=None,
+    ))
+    await wait_started.wait()
+    await handlers.cancel_callback(FakeUpdate(query), None)
+    release_wait.set()
+    await download_task
+
+    assert message.text == "Отменено."
+    assert message.reply_markup is None
+    assert cancelled_events == ["job-1"]
+    assert error_events == []
+    assert key not in handlers._state
+
+
+@pytest.mark.asyncio
+async def test_cancel_response_and_polled_cancelled_emit_one_terminal_outcome(monkeypatch):
+    message = SharedMessage()
+    query = SharedQuery(message)
+    key = handlers._state_key(10, 7, "abcd")
+    entry = {
+        "url": "https://youtu.be/x",
+        "info": {"title": "Video", "extractor": "youtube"},
+        "created": time.time(),
+        "user_id": 42,
+        "state_key": key,
+        "selection_started": True,
+        "cancel_callback_data": "cancel:7:abcd",
+    }
+    handlers._state[key] = entry
+    wait_started = asyncio.Event()
+    release_wait = asyncio.Event()
+    cancelled_events = []
+
+    async def fake_start(*args, **kwargs):
+        return "job-1"
+
+    async def cancelled_status(*args, **kwargs):
+        wait_started.set()
+        await release_wait.wait()
+        return {"status": "cancelled"}
+
+    async def cancel_reclip(job_id):
+        release_wait.set()
+        return {"job_id": job_id, "status": "cancelled"}
+
+    async def ignore_start(**kwargs):
+        pass
+
+    async def record_cancelled(*, job_id):
+        cancelled_events.append(job_id)
+
+    monkeypatch.setattr(handlers, "start_download", fake_start)
+    monkeypatch.setattr(handlers, "_wait_for_download_job", cancelled_status)
+    monkeypatch.setattr(handlers, "cancel_download", cancel_reclip)
+    monkeypatch.setattr(handlers.event_client, "send_download_start", ignore_start)
+    monkeypatch.setattr(handlers.event_client, "send_download_cancelled", record_cancelled)
+
+    download_task = asyncio.create_task(handlers.download_and_send(
+        SimpleNamespace(message=message), entry, format="video", format_id=None,
+    ))
+    await wait_started.wait()
+    await handlers.cancel_callback(FakeUpdate(query), None)
+    await download_task
+
+    assert cancelled_events == ["job-1"]
+    assert [text for text, _ in message.edits].count("Отменено.") == 1
+
+
+@pytest.mark.asyncio
+async def test_pre_upload_cancel_request_skips_upload_after_terminal_conflict(monkeypatch, tmp_path):
     downloaded_file = tmp_path / "video.mp4"
     downloaded_file.touch()
     key = handlers._state_key(10, 7, "abcd")
@@ -726,7 +1288,7 @@ async def test_pre_job_cancel_terminal_conflict_continues_normal_completion(monk
         "url": "https://youtu.be/x",
         "info": {"title": "Video", "extractor": "youtube"},
         "created": time.time(),
-        "user_id": 1,
+        "user_id": 42,
         "state_key": key,
         "cancel_callback_data": "cancel:7:abcd",
         "selection_started": True,
@@ -758,6 +1320,7 @@ async def test_pre_job_cancel_terminal_conflict_continues_normal_completion(monk
     monkeypatch.setattr(handlers, "_wait_for_download_job", fake_wait)
     monkeypatch.setattr(handlers, "send_local_path", fake_upload)
     monkeypatch.setattr(handlers.event_client, "send_download_start", ignore_event)
+    monkeypatch.setattr(handlers.event_client, "send_download_cancelled", ignore_event)
     monkeypatch.setattr(handlers.event_client, "send_download_done", ignore_event)
     monkeypatch.setattr(handlers, "DOWNLOADS_PATH", str(tmp_path))
 
@@ -766,7 +1329,8 @@ async def test_pre_job_cancel_terminal_conflict_continues_normal_completion(monk
     )
 
     assert cancelled_job_ids == ["job-1"]
-    assert uploaded_paths == [downloaded_file]
+    assert uploaded_paths == []
+    assert entry["cancelled"] is True
     assert key not in handlers._state
 
 
@@ -801,7 +1365,7 @@ async def test_late_cancel_during_upload_does_not_cancel_reclip(monkeypatch, tmp
         "url": "https://youtu.be/x",
         "info": {"title": "Video", "extractor": "youtube"},
         "created": time.time(),
-        "user_id": 1,
+        "user_id": 42,
         "cancel_callback_data": "cancel:7:abcd",
     }
     handlers._state[key] = entry
@@ -858,7 +1422,9 @@ async def test_repeated_cancel_does_not_start_download(monkeypatch):
 @pytest.mark.asyncio
 async def test_authorized_cancel_callback_keeps_two_argument_handler_contract():
     query = FakeQuery(data="cancel:7:abcd", chat_id=10, message_id=7)
-    handlers._state[handlers._state_key(10, 7, "abcd")] = {"created": time.time()}
+    handlers._state[handlers._state_key(10, 7, "abcd")] = {
+        "created": time.time(), "user_id": 42,
+    }
     callback = handlers._authorized_callback(handlers.cancel_callback, frozenset({42}))
 
     await callback(FakeUpdate(query), None)
@@ -868,11 +1434,106 @@ async def test_authorized_cancel_callback_keeps_two_argument_handler_contract():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    ("callback_name", "data"),
+    [
+        ("format_callback", "fmt:7:abcd:audio"),
+        ("format_callback", "fmt:7:abcd:back"),
+        ("quality_callback", "qty:7:abcd:22"),
+        ("russian_quality_callback", "ruqty:7:abcd:720"),
+        ("cancel_callback", "cancel:7:abcd"),
+    ],
+)
+async def test_allowlisted_non_owner_cannot_operate_another_users_card(
+    monkeypatch, callback_name, data,
+):
+    key = handlers._state_key(10, 7, "abcd")
+    entry = {
+        "url": "https://youtu.be/x",
+        "info": {
+            "title": "Video",
+            "formats": [{"id": "22", "height": 720, "label": "720p"}],
+            "russian_audio": {
+                "available": True,
+                "formats": [{"height": 720, "label": "720p"}],
+            },
+        },
+        "created": time.time(),
+        "user_id": 42,
+    }
+    handlers._state[key] = entry
+    query = FakeQuery(data=data, chat_id=10, message_id=7, user_id=7)
+    old_markup = object()
+    query.reply_markup = old_markup
+    downloads = []
+    cancellations = []
+
+    async def capture_download(*args, **kwargs):
+        downloads.append((args, kwargs))
+
+    async def capture_cancel(job_id):
+        cancellations.append(job_id)
+        return {"job_id": job_id, "status": "cancelled"}
+
+    monkeypatch.setattr(handlers, "download_and_send", capture_download)
+    monkeypatch.setattr(handlers, "cancel_download", capture_cancel)
+    callback = handlers._authorized_callback(
+        getattr(handlers, callback_name), frozenset({7, 42}),
+    )
+
+    await callback(FakeUpdate(query, user_id=7), None)
+    await asyncio.sleep(0)
+
+    assert query.answer_count == 1
+    assert downloads == []
+    assert cancellations == []
+    assert handlers._state[key] is entry
+    assert entry.get("selection_started") is not True
+    assert entry.get("cancel_requested") is not True
+    assert query.edited_text is None
+    assert query.edited_caption is None
+    assert query.reply_markup is old_markup
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("callback", "data"),
+    [
+        (handlers.format_callback, "fmt:7:abcd:audio"),
+        (handlers.quality_callback, "qty:7:abcd:22"),
+        (handlers.russian_quality_callback, "ruqty:7:abcd:720"),
+    ],
+)
+async def test_expired_selection_callbacks_remove_stale_controls(callback, data):
+    query = FakeQuery(data=data, chat_id=10, message_id=7)
+    query.reply_markup = object()
+
+    await callback(FakeUpdate(query), None)
+
+    assert query.edited_text == "Время выбора истекло. Отправьте ссылку ещё раз."
+    assert query.reply_markup is None
+
+
+@pytest.mark.asyncio
+async def test_expired_cancel_callback_only_removes_stale_controls():
+    query = FakeQuery(data="cancel:7:abcd", chat_id=10, message_id=7)
+    query.reply_markup = object()
+
+    await handlers.cancel_callback(FakeUpdate(query), None)
+
+    assert query.edited_text is None
+    assert query.reply_markup is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     ("callback", "data", "info"),
     [
         ("format_callback", "fmt:7:abcd:audio", {"title": "Video"}),
         ("format_callback", "fmt:7:abcd:video", {"title": "Video", "formats": []}),
-        ("quality_callback", "qty:7:abcd:22", {"title": "Video"}),
+        (
+            "quality_callback", "qty:7:abcd:22",
+            {"title": "Video", "formats": [{"id": "22", "height": 720}]},
+        ),
         (
             "russian_quality_callback",
             "ruqty:7:abcd:720",
@@ -886,7 +1547,7 @@ async def test_final_selection_starts_one_download_and_keeps_active_cancellation
     calls = []
     query = FakeQuery(data=data, chat_id=10, message_id=7)
     handlers._state[handlers._state_key(10, 7, "abcd")] = {
-        "url": "https://youtu.be/x", "info": info, "created": time.time(), "user_id": 1,
+        "url": "https://youtu.be/x", "info": info, "created": time.time(), "user_id": 42,
     }
 
     async def fake_download(*args, **kwargs):
@@ -911,7 +1572,7 @@ async def test_russian_quality_callback_passes_language_and_integer_height(monke
         "url": "https://youtu.be/x",
         "info": {"title": "Video"},
         "created": time.time(),
-        "user_id": 1,
+        "user_id": 42,
     }
     query = FakeQuery(data="ruqty:7:abcd:720", chat_id=10, message_id=7)
     handlers._state[handlers._state_key(10, 7, "abcd")] = entry
@@ -928,6 +1589,7 @@ async def test_russian_quality_callback_passes_language_and_integer_height(monke
         "format": "video", "format_id": None,
         "audio_language": "ru", "height": 720,
     }]
+    assert entry["retry_intent"]["audio_mode"] == "ru_if_available"
 
 
 @pytest.mark.asyncio
@@ -937,7 +1599,7 @@ async def test_russian_quality_callback_rejects_malformed_height():
         "url": "https://youtu.be/x",
         "info": {"title": "Video"},
         "created": time.time(),
-        "user_id": 1,
+        "user_id": 42,
     }
 
     await handlers.russian_quality_callback(FakeUpdate(query), None)
@@ -962,7 +1624,7 @@ async def test_russian_quality_callback_passes_no_height_for_best(monkeypatch):
         "url": "https://youtu.be/x",
         "info": {"title": "Video"},
         "created": time.time(),
-        "user_id": 1,
+        "user_id": 42,
     }
 
     async def fake_download(query_arg, entry_arg, **kwargs):
@@ -986,7 +1648,7 @@ async def test_russian_quality_callback_expires_stale_session():
         "url": "https://youtu.be/x",
         "info": {"title": "Video"},
         "created": 0,
-        "user_id": 1,
+        "user_id": 42,
     }
 
     await handlers.russian_quality_callback(FakeUpdate(query), None)
@@ -997,16 +1659,18 @@ async def test_russian_quality_callback_expires_stale_session():
 @pytest.mark.asyncio
 async def test_russian_format_callback_rejects_missing_russian_formats():
     query = FakeQuery(data="fmt:7:abcd:video_ru", chat_id=10, message_id=7)
+    query.reply_markup = object()
     handlers._state[handlers._state_key(10, 7, "abcd")] = {
         "url": "https://youtu.be/x",
         "info": {"title": "Video", "russian_audio": {"available": True, "formats": []}},
         "created": time.time(),
-        "user_id": 1,
+        "user_id": 42,
     }
 
     await handlers.format_callback(FakeUpdate(query), None)
 
     assert query.edited_text == "Русская дорожка недоступна для этого видео."
+    assert query.reply_markup is None
 
 
 @pytest.mark.asyncio

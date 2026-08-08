@@ -83,7 +83,7 @@ python -m pytest tests/ -v
 - `GET /api/file/<job_id>` — serves finished file as attachment
 
 ### Bot → Dashboard Events (`bot/event_client.py`)
-The bot sends fire-and-forget HTTP POSTs to `DASHBOARD_URL/api/events` with `type: download_start | progress | download_done | download_error`. These are best-effort; failures are logged at DEBUG and ignored.
+The bot sends fire-and-forget HTTP POSTs to `DASHBOARD_URL/api/events` with `type: download_start | download_progress | download_done | download_error | download_cancelled`. These are best-effort; failures are logged at DEBUG and ignored.
 
 ### Download Flow
 1. User sends URL → bot calls `reclip_client.get_info()`

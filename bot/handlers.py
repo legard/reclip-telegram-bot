@@ -44,6 +44,8 @@ DOWNLOADS_PATH = os.environ.get("DOWNLOADS_PATH", "/downloads")
 URL_REGEX = re.compile(r"https?://[^\s<>\"']+")
 STATE_TTL = 600  # 10 minutes
 CAPTION_MAX = 1000  # Telegram caption limit is 1024, leave headroom
+SEMANTIC_QUALITIES = frozenset({"best", "1080", "720", "480", "360"})
+FIXED_QUALITY_HEIGHTS = frozenset({1080, 720, 480, 360})
 
 
 def allowed_user_filter(ids: frozenset[int]):
@@ -96,6 +98,8 @@ async def save_final_selection(
 def _select_height(formats: list[dict], requested: str) -> int | None:
     if requested == "best":
         return None
+    if requested not in SEMANTIC_QUALITIES:
+        return None
     heights = sorted({int(item["height"]) for item in formats if item.get("height")})
     if not heights:
         return None
@@ -103,6 +107,24 @@ def _select_height(formats: list[dict], requested: str) -> int | None:
     return target if target in heights else max(
         (height for height in heights if height <= target), default=min(heights)
     )
+
+
+def _select_format_id(formats: list[dict], requested: str) -> str | None:
+    """Resolve a semantic fixed quality against current metadata."""
+    if requested == "best":
+        return None
+    selectable = [item for item in formats if item.get("id") and item.get("height")]
+    height = _select_height(selectable, requested)
+    if height is None:
+        return None
+    selected = next(
+        (
+            item for item in selectable
+            if int(item["height"]) == height
+        ),
+        None,
+    )
+    return str(selected["id"]) if selected is not None else None
 
 
 def _download_intent(
@@ -118,14 +140,17 @@ def _download_intent(
         return intent
 
     formats = info.get("formats", [])
-    if audio_mode == "ru_if_available":
+    if audio_mode in {"ru", "ru_if_available"}:
         russian_audio = info.get("russian_audio") or {}
         if russian_audio.get("available") and russian_audio.get("formats"):
             intent["audio_language"] = "ru"
             formats = russian_audio["formats"]
-        else:
+        elif audio_mode == "ru_if_available":
             intent["fallback_note"] = TEXT["russian_fallback"]
-    intent["height"] = _select_height(formats, quality)
+    if intent["audio_language"] == "ru":
+        intent["height"] = _select_height(formats, quality)
+    else:
+        intent["format_id"] = _select_format_id(formats, quality)
     return intent
 
 
@@ -134,9 +159,7 @@ async def _wait_for_download_job(job_id: str, message, entry: dict | None = None
     card = message if isinstance(message, StatusCard) else StatusCard(message)
 
     async def on_status(status):
-        if entry is not None and entry.get("cancelled"):
-            return
-        if status.get("status") != "downloading":
+        if status.get("status") not in {"downloading", "postprocessing"}:
             return
 
         stage = status.get("stage") or "downloading"
@@ -144,7 +167,16 @@ async def _wait_for_download_job(job_id: str, message, entry: dict | None = None
         if entry is None:
             await card.replace(format_progress(status))
         else:
-            await card.replace(format_progress(status), reply_markup=_cancel_markup(entry))
+            async with _entry_card_lock(entry):
+                if (
+                    entry.get("cancel_requested")
+                    or entry.get("cancelled")
+                    or entry.get("_terminal_outcome") is not None
+                ):
+                    return
+                await card.replace(
+                    format_progress(status), reply_markup=_cancel_markup(entry),
+                )
 
         try:
             await event_client.send_progress(
@@ -368,8 +400,11 @@ async def _direct_download(update: Update, status_msg, url: str, fmt: str, forma
         "url": url, "info": info, "user_id": update.effective_user.id,
         "created": time.time(), "retry_intent": semantic,
     }
-    await download_and_send(
-        SimpleNamespace(message=status_msg), entry, format=fmt, format_id=format_id,
+    _register_active_entry(status_msg, entry)
+    asyncio.create_task(
+        download_and_send(
+            SimpleNamespace(message=status_msg), entry, format=fmt, format_id=format_id,
+        )
     )
 
 
@@ -405,6 +440,50 @@ def _remove_active_entry(entry: dict) -> None:
             return
 
 
+def _register_entry(message, entry: dict, *, selection_started: bool) -> dict:
+    """Bind semantic state to its owner and visible Telegram card."""
+    chat_id = getattr(message, "chat_id", None)
+    if chat_id is None:
+        chat_id = getattr(getattr(message, "chat", None), "id", None)
+    message_id = getattr(message, "message_id", None)
+    if chat_id is None or message_id is None:
+        raise ValueError("Active download cards require chat_id and message_id")
+
+    uhash = _url_hash(entry["url"])
+    key = _state_key(chat_id, message_id, uhash)
+    entry["state_key"] = key
+    entry["message_id"] = message_id
+    if selection_started:
+        entry["selection_started"] = True
+    else:
+        entry.pop("selection_started", None)
+    entry["cancel_callback_data"] = f"cancel:{message_id}:{uhash}"
+    _state[key] = entry
+    return entry
+
+
+def _register_active_entry(message, entry: dict) -> dict:
+    return _register_entry(message, entry, selection_started=True)
+
+
+def _find_callback_entry(query, message_id: int, uhash: str) -> tuple[str, dict | None]:
+    key = _state_key(query.message.chat_id, message_id, uhash)
+    entry = _state.get(key)
+    if entry is None:
+        # Thumbnail promotion can replace the loading message after callback
+        # data has already been built. The visible card ID is authoritative.
+        visible_key = _state_key(query.message.chat_id, query.message.message_id, uhash)
+        visible_entry = _state.get(visible_key)
+        if visible_entry is not None:
+            return visible_key, visible_entry
+    return key, entry
+
+
+def _query_owns_entry(query, entry: dict) -> bool:
+    callback_user = getattr(getattr(query, "from_user", None), "id", None)
+    return callback_user is not None and callback_user == entry.get("user_id")
+
+
 def _cancel_markup(entry: dict) -> InlineKeyboardMarkup | None:
     callback_data = entry.get("cancel_callback_data")
     if not callback_data:
@@ -412,6 +491,83 @@ def _cancel_markup(entry: dict) -> InlineKeyboardMarkup | None:
     return InlineKeyboardMarkup([[
         InlineKeyboardButton(TEXT["cancel"], callback_data=callback_data)
     ]])
+
+
+def _entry_card_lock(entry: dict) -> asyncio.Lock:
+    lock = entry.get("_card_lock")
+    if lock is None:
+        lock = asyncio.Lock()
+        entry["_card_lock"] = lock
+    return lock
+
+
+def _claim_terminal(entry: dict, outcome: str) -> bool:
+    current = entry.get("_terminal_outcome")
+    if current is not None:
+        return current == outcome
+    entry["_terminal_outcome"] = outcome
+    return True
+
+
+def _begin_cancel_attempt(entry: dict) -> asyncio.Event:
+    completed = asyncio.Event()
+    entry["cancel_requested"] = True
+    entry["cancelling"] = True
+    entry["_cancel_complete"] = completed
+    return completed
+
+
+def _complete_cancel_attempt(entry: dict, completed: asyncio.Event) -> None:
+    entry["cancelling"] = False
+    completed.set()
+
+
+async def _cancel_won_after_pending_attempt(entry: dict) -> bool:
+    completed = entry.get("_cancel_complete")
+    if completed is not None and not completed.is_set():
+        await completed.wait()
+    return entry.get("_terminal_outcome") == "cancelled"
+
+
+async def _show_cancelling_card(entry: dict, card: StatusCard) -> None:
+    async with _entry_card_lock(entry):
+        if entry.get("_terminal_outcome") is not None:
+            return
+        await card.replace(TEXT["cancelling"], reply_markup=_cancel_markup(entry))
+
+
+async def _show_cancelled_card(entry: dict, card: StatusCard) -> None:
+    async with _entry_card_lock(entry):
+        if entry.get("_cancel_card_shown"):
+            return
+        entry["_cancel_card_shown"] = True
+        await card.replace(TEXT["cancelled"], reply_markup=None)
+
+
+async def _finalize_cancelled(entry: dict, card: StatusCard, job_id: str) -> bool:
+    """Claim cancellation once across callback and polling race paths."""
+    if not _claim_terminal(entry, "cancelled"):
+        return False
+
+    # Claim synchronously before the first await so another coroutine cannot
+    # publish a competing card or dashboard event.
+    entry["cancelled"] = True
+    entry["cancel_requested"] = True
+    entry["cancelling"] = False
+    entry["cancel_callback_data"] = None
+    _remove_active_entry(entry)
+
+    if not entry.get("_cancel_event_sent"):
+        entry["_cancel_event_sent"] = True
+        start_event_ready = entry.get("_start_event_ready")
+        if start_event_ready is not None and not start_event_ready.is_set():
+            await start_event_ready.wait()
+        try:
+            await event_client.send_download_cancelled(job_id=job_id)
+        except Exception:
+            logger.debug("Cancellation event failed for ReClip job %s", job_id, exc_info=True)
+    await _show_cancelled_card(entry, card)
+    return True
 
 
 def _semantic_quality(info: dict, format_id: str | None, height: int | None) -> str:
@@ -453,42 +609,25 @@ async def _present_error(card: StatusCard, code: str, *, intent: dict | None = N
         await card.replace(error_text(code), reply_markup=None)
 
 
-def _resolve_retry_intent(semantic: dict, info: dict) -> tuple[dict | None, str | None]:
-    if semantic["format"] == "audio":
-        return {
-            "format": "audio", "format_id": None,
-            "audio_language": None, "height": None,
-        }, None
+def _resolve_semantic_intent(semantic: dict, info: dict) -> tuple[dict | None, str | None]:
+    """Resolve saved/retry semantics against one fresh metadata snapshot."""
+    if semantic.get("format") not in {"audio", "video"}:
+        return None, "format_unavailable"
     if semantic["audio_mode"] == "ru":
         russian_audio = info.get("russian_audio") or {}
         formats = russian_audio.get("formats", [])
         if not russian_audio.get("available") or not formats:
             return None, "russian_audio_unavailable"
-        return {
-            "format": "video", "format_id": None,
-            "audio_language": "ru", "height": _select_height(formats, semantic["quality"]),
-        }, None
-    if semantic["format"] == "video":
-        formats = info.get("formats", [])
-        height = _select_height(formats, semantic["quality"])
-        if height is None:
-            return {
-                "format": "video", "format_id": None,
-                "audio_language": None, "height": None,
-            }, None
-        current = next(
-            (item for item in formats if item.get("height") == height and item.get("id")),
-            None,
-        )
-        if current is None:
-            return None, "format_unavailable"
-        return {
-            "format": "video", "format_id": str(current["id"]),
-            "audio_language": None, "height": None,
-        }, None
     intent = _download_intent(
         semantic["format"], semantic["quality"], semantic["audio_mode"], info,
     )
+    if (
+        semantic["format"] == "video"
+        and intent["audio_language"] is None
+        and semantic["quality"] != "best"
+        and intent["format_id"] is None
+    ):
+        return None, "format_unavailable"
     note = intent.pop("fallback_note", None)
     if note:
         intent["start_note"] = note
@@ -514,6 +653,12 @@ def _build_format_buttons(
 def _build_quality_buttons(message_id: int, url_hash: str, formats: list[dict]) -> InlineKeyboardMarkup:
     buttons = []
     for fmt in formats:
+        try:
+            height = int(fmt.get("height"))
+        except (TypeError, ValueError):
+            continue
+        if height not in FIXED_QUALITY_HEIGHTS or not fmt.get("id"):
+            continue
         label = fmt.get("label", fmt.get("id", "?"))
         buttons.append(
             InlineKeyboardButton(label, callback_data=f"qty:{message_id}:{url_hash}:{fmt['id']}")
@@ -528,13 +673,18 @@ def _build_quality_buttons(message_id: int, url_hash: str, formats: list[dict]) 
 def _build_russian_quality_buttons(
     message_id: int, url_hash: str, formats: list[dict]
 ) -> InlineKeyboardMarkup:
-    buttons = [
-        InlineKeyboardButton(
-            fmt.get("label", f'{fmt["height"]}p'),
-            callback_data=f'ruqty:{message_id}:{url_hash}:{fmt["height"]}',
-        )
-        for fmt in formats
-    ]
+    buttons = []
+    for fmt in formats:
+        try:
+            height = int(fmt.get("height"))
+        except (TypeError, ValueError):
+            continue
+        if height not in FIXED_QUALITY_HEIGHTS:
+            continue
+        buttons.append(InlineKeyboardButton(
+            fmt.get("label", f"{height}p"),
+            callback_data=f"ruqty:{message_id}:{url_hash}:{height}",
+        ))
     rows = [buttons[index:index + 3] for index in range(0, len(buttons), 3)]
     rows.append([
         InlineKeyboardButton(TEXT["best_quality"], callback_data=f"ruqty:{message_id}:{url_hash}:best")
@@ -542,6 +692,34 @@ def _build_russian_quality_buttons(
     rows.append([InlineKeyboardButton(TEXT["back"], callback_data=f"fmt:{message_id}:{url_hash}:back")])
     rows.append([InlineKeyboardButton(TEXT["cancel"], callback_data=f"cancel:{message_id}:{url_hash}")])
     return InlineKeyboardMarkup(rows)
+
+
+async def _show_manual_selection(
+    card: StatusCard,
+    *,
+    url: str,
+    info: dict,
+    user_id: int,
+) -> dict:
+    """Render and register a first-choice picker on the current card."""
+    message_id = card.message.message_id
+    uhash = _url_hash(url)
+    keyboard = _build_format_buttons(message_id, uhash, info.get("russian_audio"))
+    await card.show_info(format_info(info), keyboard, photo=info.get("thumbnail"))
+
+    shown_message = card.message
+    if shown_message.message_id != message_id:
+        keyboard = _build_format_buttons(
+            shown_message.message_id, uhash, info.get("russian_audio"),
+        )
+        await card.set_buttons(keyboard)
+    entry = {
+        "url": url,
+        "user_id": user_id,
+        "info": info,
+        "created": time.time(),
+    }
+    return _register_entry(shown_message, entry, selection_started=False)
 
 
 async def url_handler(
@@ -556,17 +734,13 @@ async def url_handler(
         return
 
     for url in urls:
-        uhash = _url_hash(url)
         status_msg = await update.message.reply_text(TEXT["info_loading"])
         card = StatusCard(status_msg)
         preferences = await load_preferences(update.effective_user.id, preference_store)
-        retry_intent = {
-            "url": url,
-            "format": (preferences or {}).get("format", "video"),
-            "quality": (preferences or {}).get("quality", "best"),
-            "audio_mode": (preferences or {}).get("audio_mode", "original"),
-            "user_id": update.effective_user.id,
+        retry_intent = dict(preferences) if preferences else {
+            "format": None, "quality": None, "audio_mode": None,
         }
+        retry_intent.update({"url": url, "user_id": update.effective_user.id})
 
         try:
             info = await get_info(url)
@@ -577,44 +751,34 @@ async def url_handler(
             continue
 
         if preferences:
+            semantic = {
+                "url": url, "format": preferences["format"],
+                "quality": preferences["quality"], "audio_mode": preferences["audio_mode"],
+                "user_id": update.effective_user.id,
+            }
+            intent, error_code = _resolve_semantic_intent(semantic, info)
+            if error_code:
+                await _present_error(card, error_code, intent=semantic)
+                continue
             entry = {
                 "url": url,
                 "user_id": update.effective_user.id,
                 "info": info,
                 "created": time.time(),
-                "retry_intent": {
-                    "url": url, "format": preferences["format"],
-                    "quality": preferences["quality"], "audio_mode": preferences["audio_mode"],
-                    "user_id": update.effective_user.id,
-                },
+                "retry_intent": semantic,
             }
-            intent = _download_intent(
-                preferences["format"], preferences["quality"],
-                preferences["audio_mode"], info,
-            )
-            fallback_note = intent.pop("fallback_note", None)
-            if fallback_note:
-                intent["start_note"] = fallback_note
+            _register_active_entry(status_msg, entry)
             asyncio.create_task(
                 download_and_send(SimpleNamespace(message=status_msg), entry, **intent)
             )
             continue
 
-        keyboard = _build_format_buttons(
-            status_msg.message_id, uhash, info.get("russian_audio")
+        await _show_manual_selection(
+            card,
+            url=url,
+            info=info,
+            user_id=update.effective_user.id,
         )
-        await card.show_info(format_info(info), keyboard, photo=info.get("thumbnail"))
-        shown_message = card.message
-        key = _state_key(update.effective_chat.id, shown_message.message_id, uhash)
-        _state[key] = {
-            "url": url,
-            "user_id": update.effective_user.id,
-            "info": info,
-            "message_id": shown_message.message_id,
-            "created": time.time(),
-        }
-        _state[key]["state_key"] = key
-        _state[key]["cancel_callback_data"] = f"cancel:{shown_message.message_id}:{uhash}"
 
 
 async def format_callback(
@@ -634,13 +798,13 @@ async def format_callback(
         return
     msg_id = int(msg_id_str)
 
-    key = _state_key(query.message.chat_id, msg_id, uhash)
-    entry = _state.get(key)
+    key, entry = _find_callback_entry(query, msg_id, uhash)
     if not entry:
-        key = _state_key(query.message.chat_id, query.message.message_id, uhash)
-        entry = _state.get(key)
-    if not entry:
-        await StatusCard(query.message, query=query).replace(TEXT["selection_expired"])
+        await StatusCard(query.message, query=query).replace(
+            TEXT["selection_expired"], reply_markup=None,
+        )
+        return
+    if not _query_owns_entry(query, entry):
         return
     if entry.get("selection_started"):
         return
@@ -680,13 +844,15 @@ async def format_callback(
             )
             return
 
-        keyboard = _build_quality_buttons(query.message.message_id, uhash, formats[:6])
+        keyboard = _build_quality_buttons(query.message.message_id, uhash, formats)
         await StatusCard(query.message, query=query).set_buttons(keyboard)
     elif fmt == "video_ru":
         russian_audio = entry["info"].get("russian_audio") or {}
         formats = russian_audio.get("formats", [])
         if not formats:
-            await StatusCard(query.message, query=query).replace(error_text("russian_audio_unavailable"))
+            await StatusCard(query.message, query=query).replace(
+                error_text("russian_audio_unavailable"), reply_markup=None,
+            )
             return
 
         keyboard = _build_russian_quality_buttons(query.message.message_id, uhash, formats)
@@ -710,28 +876,44 @@ async def quality_callback(
         return
     msg_id = int(msg_id_str)
 
-    key = _state_key(query.message.chat_id, msg_id, uhash)
-    entry = _state.get(key)
+    key, entry = _find_callback_entry(query, msg_id, uhash)
     if not entry:
-        key = _state_key(query.message.chat_id, query.message.message_id, uhash)
-        entry = _state.get(key)
-    if not entry:
-        await StatusCard(query.message, query=query).replace(TEXT["selection_expired"])
+        await StatusCard(query.message, query=query).replace(
+            TEXT["selection_expired"], reply_markup=None,
+        )
+        return
+    if not _query_owns_entry(query, entry):
         return
     if entry.get("selection_started"):
         return
 
-    fid = None if format_id == "best" else format_id
+    if format_id == "best":
+        fid = None
+        selected_quality = "best"
+    else:
+        selected = next(
+            (
+                item for item in entry["info"].get("formats", [])
+                if str(item.get("id")) == format_id
+            ),
+            None,
+        )
+        try:
+            selected_height = int(selected.get("height")) if selected else None
+        except (TypeError, ValueError):
+            selected_height = None
+        if selected_height not in FIXED_QUALITY_HEIGHTS:
+            await StatusCard(query.message, query=query).replace(
+                TEXT["selection_expired"], reply_markup=None,
+            )
+            return
+        fid = format_id
+        selected_quality = str(selected_height)
+
     entry["selection_started"] = True
-    selected = next(
-        (item for item in entry["info"].get("formats", []) if str(item.get("id")) == format_id),
-        {},
-    )
-    selected_quality = str(selected.get("height", "best"))
-    saved_quality = selected_quality if selected_quality in {"best", "1080", "720", "480", "360"} else "best"
     await save_final_selection(
         entry["user_id"],
-        {"format": "video", "quality": saved_quality, "audio_mode": "original"},
+        {"format": "video", "quality": selected_quality, "audio_mode": "original"},
         preference_store,
     )
     entry["retry_intent"] = {
@@ -761,23 +943,25 @@ async def russian_quality_callback(
         return
     msg_id = int(msg_id_str)
 
-    key = _state_key(query.message.chat_id, msg_id, uhash)
-    entry = _state.get(key)
+    key, entry = _find_callback_entry(query, msg_id, uhash)
     if not entry:
-        key = _state_key(query.message.chat_id, query.message.message_id, uhash)
-        entry = _state.get(key)
-    if not entry:
-        await StatusCard(query.message, query=query).replace(TEXT["selection_expired"])
+        await StatusCard(query.message, query=query).replace(
+            TEXT["selection_expired"], reply_markup=None,
+        )
+        return
+    if not _query_owns_entry(query, entry):
         return
     if entry.get("selection_started"):
         return
 
     if height_value == "best":
         height = None
-    elif height_value.isdecimal():
+    elif height_value.isdecimal() and int(height_value) in FIXED_QUALITY_HEIGHTS:
         height = int(height_value)
     else:
-        await StatusCard(query.message, query=query).replace(TEXT["selection_expired"])
+        await StatusCard(query.message, query=query).replace(
+            TEXT["selection_expired"], reply_markup=None,
+        )
         return
 
     entry["selection_started"] = True
@@ -785,9 +969,7 @@ async def russian_quality_callback(
         entry["user_id"],
         {
             "format": "video",
-            "quality": (
-                str(height) if str(height) in {"1080", "720", "480", "360"} else "best"
-            ),
+            "quality": str(height) if height is not None else "best",
             "audio_mode": "ru_if_available",
         },
         preference_store,
@@ -795,7 +977,7 @@ async def russian_quality_callback(
     entry["retry_intent"] = {
         "url": entry["url"], "format": "video",
         "quality": str(height) if height is not None else "best",
-        "audio_mode": "ru", "user_id": entry["user_id"],
+        "audio_mode": "ru_if_available", "user_id": entry["user_id"],
     }
     asyncio.create_task(
         download_and_send(
@@ -818,11 +1000,11 @@ async def cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(parts) != 3 or not parts[1].isdecimal():
         return
     _, msg_id_str, uhash = parts
-    key = _state_key(query.message.chat_id, int(msg_id_str), uhash)
-    if key not in _state:
-        key = _state_key(query.message.chat_id, query.message.message_id, uhash)
-    entry = _state.get(key)
+    key, entry = _find_callback_entry(query, int(msg_id_str), uhash)
     if entry is None:
+        await StatusCard(query.message, query=query).remove_buttons()
+        return
+    if not _query_owns_entry(query, entry):
         return
 
     if entry.get("upload_started") or entry.get("cancelling"):
@@ -831,30 +1013,29 @@ async def cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     job_id = entry.get("job_id")
     if not job_id:
         if not entry.get("selection_started"):
-            _state.pop(key, None)
-            await StatusCard(query.message, query=query).replace(TEXT["cancelled"], reply_markup=None)
+            _claim_terminal(entry, "cancelled")
+            entry["cancelled"] = True
+            _remove_active_entry(entry)
+            await _show_cancelled_card(entry, StatusCard(query.message, query=query))
             return
         entry["cancel_requested"] = True
-        await StatusCard(query.message, query=query).replace(TEXT["cancelled"], reply_markup=None)
+        await _show_cancelling_card(entry, StatusCard(query.message, query=query))
         return
 
-    entry["cancelling"] = True
+    completed = _begin_cancel_attempt(entry)
+    await _show_cancelling_card(entry, StatusCard(query.message, query=query))
     try:
         result = await cancel_download(job_id)
     except ReclipError:
-        entry["cancelling"] = False
         logger.debug("Cancellation failed for ReClip job %s", job_id, exc_info=True)
         return
-
-    if result.get("status") != "cancelled":
-        entry["cancelling"] = False
-        return
-
-    entry["cancelled"] = True
-    _remove_active_entry(entry)
-    await event_client.send_download_cancelled(job_id=job_id)
-
-    await StatusCard(query.message, query=query).replace(TEXT["cancelled"], reply_markup=None)
+    else:
+        if result.get("status") == "cancelled":
+            await _finalize_cancelled(
+                entry, StatusCard(query.message, query=query), job_id,
+            )
+    finally:
+        _complete_cancel_attempt(entry, completed)
 
 
 async def retry_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -873,7 +1054,16 @@ async def retry_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ReclipError as error:
         await _present_error(card, getattr(error, "error_code", "download_failed"), intent=semantic)
         return
-    intent, error_code = _resolve_retry_intent(semantic, info)
+    if semantic.get("format") is None:
+        await _show_manual_selection(
+            card,
+            url=semantic["url"],
+            info=info,
+            user_id=semantic["user_id"],
+        )
+        return
+
+    intent, error_code = _resolve_semantic_intent(semantic, info)
     if error_code:
         await _present_error(card, error_code, intent=semantic)
         return
@@ -881,6 +1071,7 @@ async def retry_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "url": semantic["url"], "user_id": semantic["user_id"], "info": info,
         "created": time.time(), "retry_intent": semantic,
     }
+    _register_active_entry(query.message, entry)
     asyncio.create_task(download_and_send(query, entry, **intent))
 
 
@@ -901,11 +1092,14 @@ async def download_and_send(
     card = StatusCard(message)
     semantic = _retry_intent(entry, format, format_id, audio_language, height)
 
-    try:
-        start_text = f"{start_note}\n\n{TEXT['download_start']}" if start_note else TEXT["download_start"]
-        await card.replace(start_text, reply_markup=_cancel_markup(entry))
-    except Exception:
-        pass
+    if not entry.get("cancel_requested") and not entry.get("cancelled"):
+        try:
+            start_text = f"{start_note}\n\n{TEXT['download_start']}" if start_note else TEXT["download_start"]
+            async with _entry_card_lock(entry):
+                if not entry.get("cancel_requested") and not entry.get("cancelled"):
+                    await card.replace(start_text, reply_markup=_cancel_markup(entry))
+        except Exception:
+            pass
 
     try:
         job_id = await start_download(
@@ -917,12 +1111,33 @@ async def download_and_send(
             height=height,
         )
     except ReclipError as error:
+        if entry.get("cancel_requested") or entry.get("cancelled"):
+            _claim_terminal(entry, "cancelled")
+            entry["cancelled"] = True
+            _remove_active_entry(entry)
+            await _show_cancelled_card(entry, card)
+            return
+        if not _claim_terminal(entry, "error"):
+            return
         await _present_error(card, getattr(error, "error_code", "download_failed"), intent=semantic)
         _stats["errors"] += 1
         _remove_active_entry(entry)
         return
 
     entry["job_id"] = job_id
+    entry["_start_event_ready"] = asyncio.Event()
+
+    cancellation_confirmed = False
+    if entry.get("cancel_requested"):
+        completed = _begin_cancel_attempt(entry)
+        try:
+            result = await cancel_download(job_id)
+        except ReclipError:
+            logger.debug("Cancellation failed for newly created ReClip job %s", job_id, exc_info=True)
+        else:
+            cancellation_confirmed = result.get("status") == "cancelled"
+        finally:
+            _complete_cancel_attempt(entry, completed)
 
     try:
         await event_client.send_download_start(
@@ -933,27 +1148,27 @@ async def download_and_send(
             url=url,
             platform=entry["info"].get("extractor", "unknown"),
             format=format,
-            quality=str(height) if height is not None else (format_id or "best"),
+            quality=semantic["quality"],
             title=title,
         )
     except Exception:
         pass
+    finally:
+        entry["_start_event_ready"].set()
 
-    if entry.get("cancel_requested"):
-        try:
-            result = await cancel_download(job_id)
-        except ReclipError:
-            logger.debug("Cancellation failed for newly created ReClip job %s", job_id, exc_info=True)
-        else:
-            if result.get("status") == "cancelled":
-                entry["cancelled"] = True
-                await event_client.send_download_cancelled(job_id=job_id)
-                _remove_active_entry(entry)
-                return
+    if entry.get("cancelled") or entry.get("_terminal_outcome") == "cancelled":
+        return
+    if cancellation_confirmed:
+        await _finalize_cancelled(entry, card, job_id)
+        return
 
     try:
         status = await _wait_for_download_job(job_id, card, entry)
     except ReclipError as error:
+        if await _cancel_won_after_pending_attempt(entry):
+            return
+        if not _claim_terminal(entry, "error"):
+            return
         error_code = _wait_error_message(error)
         await _present_error(card, error_code, intent=semantic)
         _stats["errors"] += 1
@@ -961,16 +1176,25 @@ async def download_and_send(
         _remove_active_entry(entry)
         return
 
+    if await _cancel_won_after_pending_attempt(entry):
+        return
+
     if status.get("status") == "cancelled":
-        _remove_active_entry(entry)
+        await _finalize_cancelled(entry, card, job_id)
         return
 
     if status.get("status") == "error":
+        if not _claim_terminal(entry, "error"):
+            return
         error_code = status.get("error_code", "download_failed")
         await _present_error(card, error_code, intent=semantic)
         _stats["errors"] += 1
         await event_client.send_download_error(job_id=job_id, error_message=error_code)
         _remove_active_entry(entry)
+        return
+
+    if entry.get("cancel_requested"):
+        await _finalize_cancelled(entry, card, job_id)
         return
 
     file_path = status.get("file_path") or status.get("filename")
@@ -984,6 +1208,8 @@ async def download_and_send(
     if not local_path.exists():
         local_path = Path(file_path)
     if not local_path.exists():
+        if not _claim_terminal(entry, "error"):
+            return
         await _present_error(card, "file_missing", intent=semantic)
         _stats["errors"] += 1
         await event_client.send_download_error(job_id=job_id, error_message="file_missing")
@@ -1001,6 +1227,7 @@ async def download_and_send(
         )
     except TelegramUploadError:
         logger.exception("Upload failed after retry")
+        _claim_terminal(entry, "error")
         await _present_error(card, "upload_failed", intent=semantic)
         _stats["errors"] += 1
         await event_client.send_download_error(
