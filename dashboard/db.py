@@ -155,6 +155,21 @@ async def update_download_error(*, job_id: str, error_message: str) -> None:
         await conn.commit()
 
 
+async def update_download_cancelled(*, job_id: str) -> None:
+    """Mark a download as cancelled by the user, not as an error."""
+    completed_at = _utc_now_str()
+    async with _conn() as conn:
+        await conn.execute(
+            """
+            UPDATE downloads
+            SET status='cancelled', error_message=NULL, completed_at=?
+            WHERE job_id=?
+            """,
+            (completed_at, job_id),
+        )
+        await conn.commit()
+
+
 async def get_download_by_job_id(job_id: str) -> Optional[aiosqlite.Row]:
     """Return a single download row by job_id, or None."""
     async with _conn() as conn:

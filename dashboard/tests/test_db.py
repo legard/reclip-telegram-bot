@@ -99,6 +99,19 @@ def test_update_download_error():
     assert row["completed_at"] is not None
 
 
+def test_update_download_cancelled_clears_error_message_and_sets_completion_time():
+    job_id = _job("cancelled1")
+    run(db.insert_download_start(
+        job_id=job_id, user_id=7, username="charlie",
+        chat_id=77, url="https://example.com", platform="instagram",
+    ))
+    run(db.update_download_cancelled(job_id=job_id))
+    row = run(db.get_download_by_job_id(job_id))
+    assert row["status"] == "cancelled"
+    assert row["error_message"] is None
+    assert row["completed_at"] is not None
+
+
 def test_get_download_by_job_id_missing():
     row = run(db.get_download_by_job_id("nonexistent-job-id"))
     assert row is None

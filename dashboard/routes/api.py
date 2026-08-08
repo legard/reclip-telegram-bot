@@ -94,6 +94,10 @@ async def ingest_event(request: Request) -> Dict[str, str]:
         )
         _active_downloads.pop(data["job_id"], None)
 
+    elif event_type == "download_cancelled":
+        await db.update_download_cancelled(job_id=data["job_id"])
+        _active_downloads.pop(data["job_id"], None)
+
     return {"status": "ok"}
 
 

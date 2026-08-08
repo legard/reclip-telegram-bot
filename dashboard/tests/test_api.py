@@ -1,4 +1,5 @@
 """Tests for the admin dashboard API routes."""
+import asyncio
 import json as _json
 import os
 import tempfile
@@ -13,6 +14,7 @@ os.environ["DOWNLOADS_PATH"] = _tmpdir
 
 from fastapi.testclient import TestClient
 from main import create_app
+import db
 
 app = create_app()
 client = TestClient(app, raise_server_exceptions=True)
@@ -132,6 +134,30 @@ def test_event_download_error():
         "error_message": "HTTP 403 forbidden",
     })
     assert resp.status_code == 200
+
+
+def test_cancelled_event_persists_status_removes_active_download_and_does_not_add_error():
+    job_id = "job-cancelled-1"
+    before_errors = asyncio.run(db.get_dashboard_stats())["errors_today"]
+    client.post("/api/events", json={
+        "type": "download_start",
+        "job_id": job_id,
+        "user_id": 4,
+        "username": "erin",
+        "chat_id": 4,
+        "url": "https://example.com/cancelled.mp4",
+        "platform": "youtube",
+    })
+
+    response = client.post("/api/events", json={
+        "type": "download_cancelled", "job_id": job_id,
+    })
+
+    assert response.status_code == 200
+    assert asyncio.run(db.get_download_by_job_id(job_id))["status"] == "cancelled"
+    from routes.api import _active_downloads
+    assert job_id not in _active_downloads
+    assert asyncio.run(db.get_dashboard_stats())["errors_today"] == before_errors
 
 
 # ---------------------------------------------------------------------------

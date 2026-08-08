@@ -21,6 +21,7 @@ from reclip_client import (
     ReclipServiceOutage,
     get_info,
     start_download,
+    cancel_download,
     wait_for_job,
 )
 import event_client
@@ -382,6 +383,27 @@ def _evict_stale():
         del _state[k]
 
 
+def _remove_active_entry(entry: dict) -> None:
+    """Forget an active download without removing a newer card at the same key."""
+    state_key = entry.get("state_key")
+    if state_key and _state.get(state_key) is entry:
+        _state.pop(state_key, None)
+        return
+    for key, active_entry in tuple(_state.items()):
+        if active_entry is entry:
+            _state.pop(key, None)
+            return
+
+
+def _cancel_markup(entry: dict) -> InlineKeyboardMarkup | None:
+    callback_data = entry.get("cancel_callback_data")
+    if not callback_data:
+        return None
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(TEXT["cancel"], callback_data=callback_data)
+    ]])
+
+
 def _semantic_quality(info: dict, format_id: str | None, height: int | None) -> str:
     selected_height = height
     if selected_height is None and format_id:
@@ -581,6 +603,8 @@ async def url_handler(
             "message_id": shown_message.message_id,
             "created": time.time(),
         }
+        _state[key]["state_key"] = key
+        _state[key]["cancel_callback_data"] = f"cancel:{shown_message.message_id}:{uhash}"
 
 
 async def format_callback(
@@ -608,6 +632,8 @@ async def format_callback(
     if not entry:
         await StatusCard(query.message, query=query).replace(TEXT["selection_expired"])
         return
+    if entry.get("selection_started"):
+        return
 
     if fmt == "back":
         keyboard = _build_format_buttons(
@@ -617,7 +643,7 @@ async def format_callback(
         return
 
     if fmt == "audio":
-        _state.pop(key, None)
+        entry["selection_started"] = True
         entry["retry_intent"] = {
             "url": entry["url"], "format": "audio", "quality": "best",
             "audio_mode": "original", "user_id": entry["user_id"],
@@ -633,7 +659,7 @@ async def format_callback(
     elif fmt == "video":
         formats = entry["info"].get("formats", [])
         if not formats:
-            _state.pop(key, None)
+            entry["selection_started"] = True
             await save_final_selection(
                 entry["user_id"],
                 {"format": "video", "quality": "best", "audio_mode": "original"},
@@ -682,9 +708,11 @@ async def quality_callback(
     if not entry:
         await StatusCard(query.message, query=query).replace(TEXT["selection_expired"])
         return
+    if entry.get("selection_started"):
+        return
 
     fid = None if format_id == "best" else format_id
-    _state.pop(key, None)
+    entry["selection_started"] = True
     selected = next(
         (item for item in entry["info"].get("formats", []) if str(item.get("id")) == format_id),
         {},
@@ -731,6 +759,8 @@ async def russian_quality_callback(
     if not entry:
         await StatusCard(query.message, query=query).replace(TEXT["selection_expired"])
         return
+    if entry.get("selection_started"):
+        return
 
     if height_value == "best":
         height = None
@@ -740,7 +770,7 @@ async def russian_quality_callback(
         await StatusCard(query.message, query=query).replace(TEXT["selection_expired"])
         return
 
-    _state.pop(key, None)
+    entry["selection_started"] = True
     await save_final_selection(
         entry["user_id"],
         {
@@ -781,8 +811,38 @@ async def cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     key = _state_key(query.message.chat_id, int(msg_id_str), uhash)
     if key not in _state:
         key = _state_key(query.message.chat_id, query.message.message_id, uhash)
-    if _state.pop(key, None) is None:
+    entry = _state.get(key)
+    if entry is None:
         return
+
+    if entry.get("upload_started") or entry.get("cancelling"):
+        return
+
+    job_id = entry.get("job_id")
+    if not job_id:
+        if not entry.get("selection_started"):
+            _state.pop(key, None)
+            await StatusCard(query.message, query=query).replace(TEXT["cancelled"], reply_markup=None)
+            return
+        entry["cancel_requested"] = True
+        await StatusCard(query.message, query=query).replace(TEXT["cancelled"], reply_markup=None)
+        return
+
+    entry["cancelling"] = True
+    try:
+        result = await cancel_download(job_id)
+    except ReclipError:
+        entry["cancelling"] = False
+        logger.debug("Cancellation failed for ReClip job %s", job_id, exc_info=True)
+        return
+
+    if result.get("status") != "cancelled":
+        entry["cancelling"] = False
+        return
+
+    entry["cancelled"] = True
+    _remove_active_entry(entry)
+    await event_client.send_download_cancelled(job_id=job_id)
 
     await StatusCard(query.message, query=query).replace(TEXT["cancelled"], reply_markup=None)
 
@@ -833,7 +893,7 @@ async def download_and_send(
 
     try:
         start_text = f"{start_note}\n\n{TEXT['download_start']}" if start_note else TEXT["download_start"]
-        await card.replace(start_text, reply_markup=None)
+        await card.replace(start_text, reply_markup=_cancel_markup(entry))
     except Exception:
         pass
 
@@ -849,7 +909,10 @@ async def download_and_send(
     except ReclipError as error:
         await _present_error(card, getattr(error, "error_code", "download_failed"), intent=semantic)
         _stats["errors"] += 1
+        _remove_active_entry(entry)
         return
+
+    entry["job_id"] = job_id
 
     try:
         await event_client.send_download_start(
@@ -866,6 +929,19 @@ async def download_and_send(
     except Exception:
         pass
 
+    if entry.get("cancel_requested"):
+        try:
+            result = await cancel_download(job_id)
+        except ReclipError:
+            logger.debug("Cancellation failed for newly created ReClip job %s", job_id, exc_info=True)
+            _remove_active_entry(entry)
+            return
+        if result.get("status") == "cancelled":
+            entry["cancelled"] = True
+            await event_client.send_download_cancelled(job_id=job_id)
+            _remove_active_entry(entry)
+            return
+
     try:
         status = await _wait_for_download_job(job_id, card)
     except ReclipError as error:
@@ -873,6 +949,11 @@ async def download_and_send(
         await _present_error(card, error_code, intent=semantic)
         _stats["errors"] += 1
         await event_client.send_download_error(job_id=job_id, error_message=error_code)
+        _remove_active_entry(entry)
+        return
+
+    if status.get("status") == "cancelled":
+        _remove_active_entry(entry)
         return
 
     if status.get("status") == "error":
@@ -880,6 +961,7 @@ async def download_and_send(
         await _present_error(card, error_code, intent=semantic)
         _stats["errors"] += 1
         await event_client.send_download_error(job_id=job_id, error_message=error_code)
+        _remove_active_entry(entry)
         return
 
     file_path = status.get("file_path") or status.get("filename")
@@ -896,9 +978,12 @@ async def download_and_send(
         await _present_error(card, "file_missing", intent=semantic)
         _stats["errors"] += 1
         await event_client.send_download_error(job_id=job_id, error_message="file_missing")
+        _remove_active_entry(entry)
         return
 
     try:
+        entry["upload_started"] = True
+        await card.remove_buttons()
         file_size = await send_local_path(
             query.message.chat,
             local_path,
@@ -912,6 +997,7 @@ async def download_and_send(
         await event_client.send_download_error(
             job_id=job_id, error_message="upload_failed"
         )
+        _remove_active_entry(entry)
         return
 
     _stats["downloads"] += 1
@@ -926,6 +1012,7 @@ async def download_and_send(
         pass
 
     await card.complete()
+    _remove_active_entry(entry)
 
 def _with_preferences(callback, preference_store: PreferenceStore | None):
     @wraps(callback)

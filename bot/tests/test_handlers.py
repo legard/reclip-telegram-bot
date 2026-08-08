@@ -547,6 +547,104 @@ async def test_cancel_removes_session_and_replaces_photo_caption():
 
 
 @pytest.mark.asyncio
+async def test_active_job_cancel_calls_reclip_and_reports_cancelled(monkeypatch):
+    key = handlers._state_key(10, 7, "abcd")
+    handlers._state[key] = {
+        "created": time.time(), "job_id": "job-1", "upload_started": False,
+    }
+    query = FakeQuery(data="cancel:7:abcd", chat_id=10, message_id=7)
+    cancelled_job_ids = []
+    event_types = []
+
+    async def cancel_reclip(job_id):
+        cancelled_job_ids.append(job_id)
+        return {"job_id": job_id, "status": "cancelled"}
+
+    async def report_cancelled(*, job_id):
+        event_types.append(("download_cancelled", job_id))
+
+    monkeypatch.setattr(handlers, "cancel_download", cancel_reclip)
+    monkeypatch.setattr(handlers.event_client, "send_download_cancelled", report_cancelled)
+
+    await handlers.cancel_callback(FakeUpdate(query), None)
+
+    assert cancelled_job_ids == ["job-1"]
+    assert event_types == [("download_cancelled", "job-1")]
+    assert key not in handlers._state
+    assert query.edited_text == "Отменено."
+
+
+@pytest.mark.asyncio
+async def test_late_cancel_during_upload_does_not_cancel_reclip(monkeypatch, tmp_path):
+    uploaded_file = tmp_path / "video.mp4"
+    uploaded_file.touch()
+    key = handlers._state_key(10, 7, "abcd")
+    cancellation_query = FakeQuery(data="cancel:7:abcd", chat_id=10, message_id=7)
+
+    class DownloadMessage:
+        photo = False
+        chat = object()
+        chat_id = 10
+        message_id = 7
+
+        def __init__(self):
+            self.button_edits = []
+
+        async def edit_text(self, text, **kwargs):
+            pass
+
+        async def edit_reply_markup(self, *, reply_markup):
+            self.button_edits.append(reply_markup)
+
+        async def delete(self):
+            pass
+
+    message = DownloadMessage()
+    cancellation_query.message = message
+    entry = {
+        "url": "https://youtu.be/x",
+        "info": {"title": "Video", "extractor": "youtube"},
+        "created": time.time(),
+        "user_id": 1,
+        "cancel_callback_data": "cancel:7:abcd",
+    }
+    handlers._state[key] = entry
+    cancelled_job_ids = []
+
+    async def fake_start(*args, **kwargs):
+        return "job-1"
+
+    async def fake_wait(*args, **kwargs):
+        return {"status": "done", "file_path": str(uploaded_file)}
+
+    async def ignore_event(**kwargs):
+        pass
+
+    async def fake_cancel(job_id):
+        cancelled_job_ids.append(job_id)
+
+    async def fake_upload(*args, **kwargs):
+        assert entry["upload_started"] is True
+        await handlers.cancel_callback(FakeUpdate(cancellation_query), None)
+        return 1
+
+    monkeypatch.setattr(handlers, "start_download", fake_start)
+    monkeypatch.setattr(handlers, "_wait_for_download_job", fake_wait)
+    monkeypatch.setattr(handlers, "send_local_path", fake_upload)
+    monkeypatch.setattr(handlers, "cancel_download", fake_cancel)
+    monkeypatch.setattr(handlers.event_client, "send_download_start", ignore_event)
+    monkeypatch.setattr(handlers.event_client, "send_download_done", ignore_event)
+    monkeypatch.setattr(handlers, "DOWNLOADS_PATH", str(tmp_path))
+
+    await handlers.download_and_send(
+        SimpleNamespace(message=message), entry, format="video", format_id=None,
+    )
+
+    assert cancelled_job_ids == []
+    assert message.button_edits == [None]
+
+
+@pytest.mark.asyncio
 async def test_repeated_cancel_does_not_start_download(monkeypatch):
     query = FakeQuery(data="cancel:7:abcd", chat_id=10, message_id=7)
     started = []
@@ -586,7 +684,7 @@ async def test_authorized_cancel_callback_keeps_two_argument_handler_contract():
         ),
     ],
 )
-async def test_final_selection_starts_one_download_and_consumes_session(
+async def test_final_selection_starts_one_download_and_keeps_active_cancellation_state(
     monkeypatch, callback, data, info
 ):
     calls = []
@@ -606,7 +704,8 @@ async def test_final_selection_starts_one_download_and_consumes_session(
     await asyncio.sleep(0)
 
     assert len(calls) == 1
-    assert handlers._state == {}
+    active_entry = handlers._state[handlers._state_key(10, 7, "abcd")]
+    assert active_entry["selection_started"] is True
 
 
 @pytest.mark.asyncio

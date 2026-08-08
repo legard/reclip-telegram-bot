@@ -108,3 +108,17 @@ async def send_download_error(
             await client.post(f"{DASHBOARD_URL}/api/events", json=payload)
     except Exception as e:
         logger.debug("event_client.send_download_error failed: %s", e)
+
+
+async def send_download_cancelled(job_id: str) -> None:
+    """Record a user-cancelled ReClip job without affecting error metrics."""
+    try:
+        payload = {
+            "type": "download_cancelled",
+            "ts": _now_iso(),
+            "job_id": job_id,
+        }
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            await client.post(f"{DASHBOARD_URL}/api/events", json=payload)
+    except Exception as e:
+        logger.debug("event_client.send_download_cancelled failed: %s", e)

@@ -75,3 +75,27 @@ def test_send_download_error_no_raise():
         job_id="job-1",
         error_message="Download timed out",
     ))
+
+
+def test_send_download_cancelled_uses_download_cancelled_payload(monkeypatch):
+    captured = {}
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            pass
+
+        async def post(self, url, json):
+            captured.update(json)
+
+    monkeypatch.setattr(event_client.httpx, "AsyncClient", FakeAsyncClient)
+
+    asyncio.run(event_client.send_download_cancelled(job_id="job-cancelled-1"))
+
+    assert captured["type"] == "download_cancelled"
+    assert captured["job_id"] == "job-cancelled-1"
