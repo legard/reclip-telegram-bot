@@ -97,6 +97,29 @@ async def test_wait_helper_edits_only_when_download_stage_or_progress_changes(mo
     assert message.edits == ["Загрузка: 10%", "Обработка файла…"]
 
 
+@pytest.mark.asyncio
+async def test_wait_helper_keeps_download_alive_when_a_normal_card_edit_fails(monkeypatch):
+    class FailingMessage:
+        photo = False
+
+        async def edit_text(self, text, **kwargs):
+            raise RuntimeError("Telegram edit failed")
+
+    async def fake_wait_for_job(job_id, on_status):
+        await on_status({"status": "downloading", "progress": {"percent": 10}})
+        return {"status": "done", "file_path": "/downloads/video.mp4"}
+
+    async def ignore_progress(**kwargs):
+        pass
+
+    monkeypatch.setattr(handlers, "wait_for_job", fake_wait_for_job)
+    monkeypatch.setattr(handlers.event_client, "send_progress", ignore_progress)
+
+    result = await handlers._wait_for_download_job("job-1", FailingMessage())
+
+    assert result["status"] == "done"
+
+
 def test_format_buttons_show_ru_only_when_available():
     hidden = handlers._build_format_buttons(7, "abcd", {"available": False, "formats": []})
     shown = handlers._build_format_buttons(
@@ -171,8 +194,51 @@ async def test_retry_refetches_info_and_resolves_current_semantic_height(monkeyp
     assert entry["url"] == "https://youtu.be/x"
     assert entry["info"]["title"] == "Новая версия"
     assert intent == {
-        "format": "video", "format_id": None,
-        "audio_language": None, "height": 360,
+        "format": "video", "format_id": "new-360",
+        "audio_language": None, "height": None,
+    }
+
+    await handlers.retry_callback(FakeUpdate(query), None)
+    await asyncio.sleep(0)
+    assert len(started) == 1
+
+
+@pytest.mark.asyncio
+async def test_url_metadata_failure_offers_semantic_retry_with_default_intent(monkeypatch):
+    class StatusMessage:
+        photo = False
+        message_id = 7
+
+        def __init__(self):
+            self.edits = []
+
+        async def edit_text(self, text, **kwargs):
+            self.edits.append((text, kwargs))
+
+    status = StatusMessage()
+
+    class Message:
+        text = "https://youtu.be/x"
+
+        async def reply_text(self, text, **kwargs):
+            return status
+
+    async def unavailable(url):
+        raise ReclipInfoError("backend timeout", error_code="network")
+
+    monkeypatch.setattr(handlers, "get_info", unavailable)
+    update = SimpleNamespace(
+        message=Message(), effective_user=SimpleNamespace(id=42), effective_chat=SimpleNamespace(id=10),
+    )
+
+    await handlers.url_handler(update, None)
+
+    text, kwargs = status.edits[-1]
+    assert text == "Не удалось загрузить файл. Попробуйте ещё раз."
+    token = button_callbacks(kwargs["reply_markup"])[0].removeprefix("retry:")
+    assert handlers._retry_store.get(token) == {
+        "url": "https://youtu.be/x", "format": "video", "quality": "best",
+        "audio_mode": "original", "user_id": 42,
     }
 
 
@@ -298,10 +364,11 @@ async def test_high_russian_height_starts_strict_download_and_saves_best_semanti
     store = PreferenceStore(str(tmp_path / "bot.db"))
     await store.initialize()
     query = FakeQuery(data="ruqty:7:abcd:2160", chat_id=10, message_id=7)
-    handlers._state[handlers._state_key(10, 7, "abcd")] = {
+    entry = {
         "url": "https://youtu.be/x", "info": {"title": "Video"},
         "created": time.time(), "user_id": 42,
     }
+    handlers._state[handlers._state_key(10, 7, "abcd")] = entry
     calls = []
 
     async def fake_download(*args, **kwargs):
@@ -319,6 +386,28 @@ async def test_high_russian_height_starts_strict_download_and_saves_best_semanti
     assert await store.get(42) == {
         "format": "video", "quality": "best", "audio_mode": "ru_if_available",
     }
+    assert entry["retry_intent"]["quality"] == "2160"
+
+
+@pytest.mark.asyncio
+async def test_high_normal_quality_keeps_raw_height_for_semantic_retry(monkeypatch):
+    entry = {
+        "url": "https://youtu.be/x",
+        "info": {"title": "Video", "formats": [{"id": "high-id", "height": 1440}]},
+        "created": time.time(), "user_id": 42,
+    }
+    query = FakeQuery(data="qty:7:abcd:high-id", chat_id=10, message_id=7)
+    handlers._state[handlers._state_key(10, 7, "abcd")] = entry
+
+    async def ignore_download(*args, **kwargs):
+        pass
+
+    monkeypatch.setattr(handlers, "download_and_send", ignore_download)
+
+    await handlers.quality_callback(FakeUpdate(query), None)
+    await asyncio.sleep(0)
+
+    assert entry["retry_intent"]["quality"] == "1440"
 
 
 @pytest.mark.asyncio

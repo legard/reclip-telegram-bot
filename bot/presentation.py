@@ -2,6 +2,10 @@
 
 import secrets
 import time
+import logging
+
+
+logger = logging.getLogger(__name__)
 
 
 ERROR_TEXT = {
@@ -134,7 +138,7 @@ class StatusCard:
     def is_photo(self) -> bool:
         return bool(getattr(self.message, "photo", False))
 
-    async def _edit(self, text: str, **kwargs) -> None:
+    async def _edit(self, text: str, **kwargs) -> bool:
         method = None
         call_kwargs = kwargs
         if self.query is not None:
@@ -156,40 +160,51 @@ class StatusCard:
                 await method(text, **call_kwargs)
         except TypeError:
             # Small test doubles and older adapters may not accept markup kwargs.
-            if self.query is not None and not self.is_photo:
-                await method(text)
-            elif self.is_photo:
-                await method(caption=text)
-            else:
-                await method(text)
+            try:
+                if self.query is not None and not self.is_photo:
+                    await method(text)
+                elif self.is_photo:
+                    await method(caption=text)
+                else:
+                    await method(text)
+            except Exception:
+                logger.debug("Telegram card edit failed", exc_info=True)
+                return False
+        except Exception:
+            logger.debug("Telegram card edit failed", exc_info=True)
+            return False
+        return True
 
     async def show_info(self, text: str, buttons=None, *, photo=None) -> None:
         """Show metadata on this card, upgrading it to a thumbnail card when possible."""
         if photo and self.query is None and hasattr(self.message, "reply_photo"):
+            previous = self.message
             try:
-                previous = self.message
+                await previous.delete()
+            except Exception:
+                await self.replace(text, reply_markup=buttons, parse_mode="MarkdownV2")
+                return
+            try:
                 sent = await previous.reply_photo(
                     photo=photo,
                     caption=text,
                     parse_mode="MarkdownV2",
                     reply_markup=buttons,
                 )
-                try:
-                    await previous.delete()
-                except Exception:
-                    # A text card is still safer than leaving two cards visible.
-                    try:
-                        await sent.delete()
-                    except Exception:
-                        pass
-                    await self.replace(text, reply_markup=buttons, parse_mode="MarkdownV2")
-                    return
                 self.message = sent
                 self._last_text = text
                 self._buttons = buttons
                 return
             except Exception:
-                pass
+                try:
+                    self.message = await previous.reply_text(
+                        text, parse_mode="MarkdownV2", reply_markup=buttons,
+                    )
+                    self._last_text = text
+                    self._buttons = buttons
+                    return
+                except Exception:
+                    logger.debug("Telegram thumbnail promotion failed", exc_info=True)
         await self.replace(text, reply_markup=buttons, parse_mode="MarkdownV2")
 
     async def replace(self, text: str, *, reply_markup=_UNSET, parse_mode=None) -> None:
@@ -201,16 +216,20 @@ class StatusCard:
             self._buttons = reply_markup
         if parse_mode is not None:
             kwargs["parse_mode"] = parse_mode
-        await self._edit(text, **kwargs)
-        self._last_text = text
+        if await self._edit(text, **kwargs):
+            self._last_text = text
 
     async def set_buttons(self, buttons) -> None:
         if buttons == self._buttons:
             return
-        if self.query is not None:
-            await self.query.edit_message_reply_markup(reply_markup=buttons)
-        else:
-            await self.message.edit_reply_markup(reply_markup=buttons)
+        try:
+            if self.query is not None:
+                await self.query.edit_message_reply_markup(reply_markup=buttons)
+            else:
+                await self.message.edit_reply_markup(reply_markup=buttons)
+        except Exception:
+            logger.debug("Telegram card button edit failed", exc_info=True)
+            return
         self._buttons = buttons
 
     async def remove_buttons(self) -> None:
@@ -251,4 +270,10 @@ class RetryStore:
     def get(self, token: str) -> dict | None:
         self._cleanup()
         item = self._items.get(token)
+        return dict(item[1]) if item is not None else None
+
+    def take(self, token: str) -> dict | None:
+        """Atomically consume a retry token so callbacks cannot replay it."""
+        self._cleanup()
+        item = self._items.pop(token, None)
         return dict(item[1]) if item is not None else None

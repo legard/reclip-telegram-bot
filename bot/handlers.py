@@ -436,6 +436,24 @@ def _resolve_retry_intent(semantic: dict, info: dict) -> tuple[dict | None, str 
             "format": "video", "format_id": None,
             "audio_language": "ru", "height": _select_height(formats, semantic["quality"]),
         }, None
+    if semantic["format"] == "video":
+        formats = info.get("formats", [])
+        height = _select_height(formats, semantic["quality"])
+        if height is None:
+            return {
+                "format": "video", "format_id": None,
+                "audio_language": None, "height": None,
+            }, None
+        current = next(
+            (item for item in formats if item.get("height") == height and item.get("id")),
+            None,
+        )
+        if current is None:
+            return None, "format_unavailable"
+        return {
+            "format": "video", "format_id": str(current["id"]),
+            "audio_language": None, "height": None,
+        }, None
     intent = _download_intent(
         semantic["format"], semantic["quality"], semantic["audio_mode"], info,
     )
@@ -509,14 +527,23 @@ async def url_handler(
         uhash = _url_hash(url)
         status_msg = await update.message.reply_text(TEXT["info_loading"])
         card = StatusCard(status_msg)
+        preferences = await load_preferences(update.effective_user.id, preference_store)
+        retry_intent = {
+            "url": url,
+            "format": (preferences or {}).get("format", "video"),
+            "quality": (preferences or {}).get("quality", "best"),
+            "audio_mode": (preferences or {}).get("audio_mode", "original"),
+            "user_id": update.effective_user.id,
+        }
 
         try:
             info = await get_info(url)
         except ReclipError as error:
-            await _present_error(card, getattr(error, "error_code", "download_failed"))
+            await _present_error(
+                card, getattr(error, "error_code", "download_failed"), intent=retry_intent,
+            )
             continue
 
-        preferences = await load_preferences(update.effective_user.id, preference_store)
         if preferences:
             entry = {
                 "url": url,
@@ -662,16 +689,15 @@ async def quality_callback(
         (item for item in entry["info"].get("formats", []) if str(item.get("id")) == format_id),
         {},
     )
-    saved_quality = str(selected.get("height", "best"))
-    if saved_quality not in {"best", "1080", "720", "480", "360"}:
-        saved_quality = "best"
+    selected_quality = str(selected.get("height", "best"))
+    saved_quality = selected_quality if selected_quality in {"best", "1080", "720", "480", "360"} else "best"
     await save_final_selection(
         entry["user_id"],
         {"format": "video", "quality": saved_quality, "audio_mode": "original"},
         preference_store,
     )
     entry["retry_intent"] = {
-        "url": entry["url"], "format": "video", "quality": saved_quality,
+        "url": entry["url"], "format": "video", "quality": selected_quality,
         "audio_mode": "original", "user_id": entry["user_id"],
     }
     asyncio.create_task(
@@ -728,7 +754,7 @@ async def russian_quality_callback(
     )
     entry["retry_intent"] = {
         "url": entry["url"], "format": "video",
-        "quality": str(height) if str(height) in {"1080", "720", "480", "360"} else "best",
+        "quality": str(height) if height is not None else "best",
         "audio_mode": "ru", "user_id": entry["user_id"],
     }
     asyncio.create_task(
@@ -766,7 +792,7 @@ async def retry_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     _, _, token = query.data.partition(":")
     card = StatusCard(query.message, query=query)
-    semantic = _retry_store.get(token)
+    semantic = _retry_store.take(token)
     if not token or semantic is None or semantic.get("user_id") != update.effective_user.id:
         await card.replace(TEXT["retry_expired"], reply_markup=None)
         return

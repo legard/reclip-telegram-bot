@@ -83,6 +83,23 @@ async def test_completed_card_falls_back_when_telegram_delete_fails():
     assert message.text_edits == [("Готово", {"reply_markup": None})]
 
 
+@pytest.mark.asyncio
+async def test_thumbnail_promotion_deletes_text_card_before_sending_photo():
+    events = []
+
+    class PromotableMessage(TextMessage):
+        async def delete(self):
+            events.append("delete")
+
+        async def reply_photo(self, **kwargs):
+            events.append("photo")
+            return PhotoMessage()
+
+    await StatusCard(PromotableMessage()).show_info("*Видео*", photo="https://example.test/thumb.jpg")
+
+    assert events == ["delete", "photo"]
+
+
 def test_retry_store_expires_and_keeps_only_semantic_intent():
     now = [1000.0]
     store = RetryStore(now=lambda: now[0])
@@ -98,3 +115,14 @@ def test_retry_store_expires_and_keeps_only_semantic_intent():
     }
     now[0] += 24 * 60 * 60 + 1
     assert store.get(token) is None
+
+
+def test_retry_store_consumes_a_token_only_once():
+    store = RetryStore()
+    token = store.put({
+        "url": "https://youtu.be/x", "format": "video", "quality": "720",
+        "audio_mode": "original",
+    })
+
+    assert store.take(token)["url"] == "https://youtu.be/x"
+    assert store.take(token) is None
