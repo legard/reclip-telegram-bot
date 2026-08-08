@@ -634,6 +634,75 @@ async def test_active_job_cancel_remains_available_after_selection_ttl(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_stale_progress_after_successful_cancel_does_not_restore_cancel_button(monkeypatch):
+    class RaceMessage:
+        photo = False
+        chat_id = 10
+        message_id = 7
+
+        def __init__(self):
+            self.text = None
+            self.reply_markup = None
+
+        async def edit_text(self, text, **kwargs):
+            self.text = text
+            self.reply_markup = kwargs.get("reply_markup", self.reply_markup)
+
+    class RaceQuery:
+        data = "cancel:7:abcd"
+
+        def __init__(self, message):
+            self.message = message
+
+        async def answer(self):
+            pass
+
+        async def edit_message_text(self, text, **kwargs):
+            await self.message.edit_text(text, **kwargs)
+
+        async def edit_message_reply_markup(self, *, reply_markup):
+            self.message.reply_markup = reply_markup
+
+    key = handlers._state_key(10, 7, "abcd")
+    entry = {
+        "created": time.time(),
+        "selection_started": True,
+        "job_id": "job-1",
+        "cancel_callback_data": "cancel:7:abcd",
+    }
+    handlers._state[key] = entry
+    message = RaceMessage()
+    query = RaceQuery(message)
+    poll_started = asyncio.Event()
+    release_stale_progress = asyncio.Event()
+
+    async def fake_wait_for_job(job_id, on_status):
+        poll_started.set()
+        await release_stale_progress.wait()
+        await on_status({"status": "downloading", "progress": {"percent": 10}})
+        return {"status": "cancelled"}
+
+    async def cancel_reclip(job_id):
+        return {"job_id": job_id, "status": "cancelled"}
+
+    async def ignore_event(**kwargs):
+        pass
+
+    monkeypatch.setattr(handlers, "wait_for_job", fake_wait_for_job)
+    monkeypatch.setattr(handlers, "cancel_download", cancel_reclip)
+    monkeypatch.setattr(handlers.event_client, "send_download_cancelled", ignore_event)
+
+    wait_task = asyncio.create_task(handlers._wait_for_download_job("job-1", message, entry))
+    await poll_started.wait()
+    await handlers.cancel_callback(FakeUpdate(query), None)
+    release_stale_progress.set()
+    await wait_task
+
+    assert message.text == "Отменено."
+    assert message.reply_markup is None
+
+
+@pytest.mark.asyncio
 async def test_pre_job_cancel_terminal_conflict_continues_normal_completion(monkeypatch, tmp_path):
     downloaded_file = tmp_path / "video.mp4"
     downloaded_file.touch()

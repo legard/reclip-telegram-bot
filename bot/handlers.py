@@ -134,6 +134,8 @@ async def _wait_for_download_job(job_id: str, message, entry: dict | None = None
     card = message if isinstance(message, StatusCard) else StatusCard(message)
 
     async def on_status(status):
+        if entry is not None and entry.get("cancelled"):
+            return
         if status.get("status") != "downloading":
             return
 
