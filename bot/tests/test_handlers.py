@@ -200,6 +200,73 @@ async def test_first_russian_mp4_choice_saves_soft_future_audio_mode(tmp_path, m
 
 
 @pytest.mark.asyncio
+async def test_high_russian_height_starts_strict_download_and_saves_best_semantic_quality(
+    tmp_path, monkeypatch,
+):
+    store = PreferenceStore(str(tmp_path / "bot.db"))
+    await store.initialize()
+    query = FakeQuery(data="ruqty:7:abcd:2160", chat_id=10, message_id=7)
+    handlers._state[handlers._state_key(10, 7, "abcd")] = {
+        "url": "https://youtu.be/x", "info": {"title": "Video"},
+        "created": time.time(), "user_id": 42,
+    }
+    calls = []
+
+    async def fake_download(*args, **kwargs):
+        calls.append(kwargs)
+
+    monkeypatch.setattr(handlers, "download_and_send", fake_download)
+
+    await handlers.russian_quality_callback(FakeUpdate(query), None, store)
+    await asyncio.sleep(0)
+
+    assert calls == [{
+        "format": "video", "format_id": None,
+        "audio_language": "ru", "height": 2160,
+    }]
+    assert await store.get(42) == {
+        "format": "video", "quality": "best", "audio_mode": "ru_if_available",
+    }
+
+
+@pytest.mark.asyncio
+async def test_download_start_keeps_russian_audio_fallback_note_visible(monkeypatch):
+    edits = []
+
+    class Message:
+        photo = False
+        chat = object()
+        chat_id = 10
+
+        async def edit_text(self, text):
+            edits.append(text)
+
+    async def fake_start(*args, **kwargs):
+        return "job-1"
+
+    async def fake_wait(*args, **kwargs):
+        return {"status": "error", "error": "stop"}
+
+    async def ignore_event(**kwargs):
+        pass
+
+    monkeypatch.setattr(handlers, "start_download", fake_start)
+    monkeypatch.setattr(handlers, "_wait_for_download_job", fake_wait)
+    monkeypatch.setattr(handlers.event_client, "send_download_start", ignore_event)
+    monkeypatch.setattr(handlers.event_client, "send_download_error", ignore_event)
+
+    await handlers.download_and_send(
+        SimpleNamespace(message=Message()),
+        {"url": "https://youtu.be/x", "info": {"title": "Video"}, "user_id": 42, "created": time.time()},
+        format="video",
+        format_id=None,
+        start_note="Русская дорожка недоступна — скачиваем оригинал.",
+    )
+
+    assert edits[0] == "Русская дорожка недоступна — скачиваем оригинал.\n\nStarting download..."
+
+
+@pytest.mark.asyncio
 async def test_saved_preferences_auto_start_semantic_download_without_session(monkeypatch, tmp_path):
     store = PreferenceStore(str(tmp_path / "bot.db"))
     await store.initialize()
@@ -240,8 +307,8 @@ async def test_saved_preferences_auto_start_semantic_download_without_session(mo
 
     assert started[0][1] == {
         "format": "video", "format_id": None, "audio_language": None, "height": 720,
+        "start_note": "Русская дорожка недоступна — скачиваем оригинал.",
     }
-    assert status.text == "Русская дорожка недоступна — скачиваем оригинал."
     assert handlers._state == {}
 
 

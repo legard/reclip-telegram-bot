@@ -607,7 +607,7 @@ async def url_handler(
             )
             fallback_note = intent.pop("fallback_note", None)
             if fallback_note:
-                await status_msg.edit_text(fallback_note)
+                intent["start_note"] = fallback_note
             asyncio.create_task(
                 download_and_send(SimpleNamespace(message=status_msg), entry, **intent)
             )
@@ -827,7 +827,9 @@ async def russian_quality_callback(
         entry["user_id"],
         {
             "format": "video",
-            "quality": str(height) if height is not None else "best",
+            "quality": (
+                str(height) if str(height) in {"1080", "720", "480", "360"} else "best"
+            ),
             "audio_mode": "ru_if_available",
         },
         preference_store,
@@ -873,6 +875,7 @@ async def download_and_send(
     *,
     audio_language: str | None = None,
     height: int | None = None,
+    start_note: str | None = None,
 ):
     chat_id = query.message.chat_id
     message = query.message
@@ -880,7 +883,8 @@ async def download_and_send(
     title = entry["info"].get("title", "download")
 
     try:
-        await message.edit_caption(caption="Starting download...") if message.photo else await message.edit_text("Starting download...")
+        start_text = f"{start_note}\n\nStarting download..." if start_note else "Starting download..."
+        await message.edit_caption(caption=start_text) if message.photo else await message.edit_text(start_text)
     except Exception:
         pass
 
