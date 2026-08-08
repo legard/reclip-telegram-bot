@@ -73,7 +73,8 @@ python -m pytest tests/ -v
 ### Reclip API Surface (`reclip/app.py`)
 - `POST /api/info` — returns title, thumbnail, duration, uploader, extractor, and available quality formats
 - `POST /api/download` — spawns a threaded yt-dlp download, returns `job_id`
-- `GET /api/status/<job_id>` — returns `status` (`downloading` | `done` | `error`), progress dict, file metadata
+- `GET /api/status/<job_id>` — returns `status` (`queued` | `downloading` | `postprocessing` | `done` | `error` | `cancelled`), progress dict, file metadata, and stable `error_code`
+- `POST /api/cancel/<job_id>` — idempotently cancels queued/running jobs and cleans partial output
 - `GET /api/file/<job_id>` — serves finished file as attachment
 
 ### Bot → Dashboard Events (`bot/event_client.py`)

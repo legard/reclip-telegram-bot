@@ -64,6 +64,9 @@ DOWNLOAD_ERROR_CHAR_LIMIT = 1500
 RUSSIAN_AUDIO_UNAVAILABLE_ERROR = "Russian audio track is no longer available. Please retry."
 FFMPEG_TIMEOUT_EXIT_CODE = 146
 DOWNLOAD_RETRY_DELAYS = (2, 5)
+QUEUE_WAIT_TIMEOUT = 30
+SEMAPHORE_POLL_SECONDS = 0.1
+TERMINAL_JOB_STATUSES = frozenset({"done", "error", "cancelled"})
 URL_PATTERN = re.compile(r"https?://\S+", re.IGNORECASE)
 TOKEN_PATTERN = re.compile(
     r"(?<![A-Za-z0-9_-])\d{6,}:[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_-])"
@@ -142,6 +145,36 @@ def summarize_download_error(diagnostics):
     return summary[-DOWNLOAD_ERROR_CHAR_LIMIT:]
 
 
+def classify_error_code(error, *, default):
+    """Reduce unstable yt-dlp/transport text to the bot's stable error vocabulary."""
+    if isinstance(error, subprocess.TimeoutExpired):
+        return "info_timeout"
+    if isinstance(error, (ConnectionError, TimeoutError)):
+        return "network"
+
+    message = str(error).lower()
+    if any(marker in message for marker in (
+        "sign in", "log in", "login", "authentication", "cookies",
+        "private video", "members-only", "age-restricted",
+    )):
+        return "auth_required"
+    if any(marker in message for marker in (
+        "requested format", "format is not available", "no video formats",
+        "no suitable formats",
+    )):
+        return "format_unavailable"
+    if any(marker in message for marker in (
+        "connection", "network", "timed out", "timeout", "temporary failure",
+        "unable to download webpage", "name resolution", "dns",
+    )):
+        return "network"
+    if any(marker in message for marker in (
+        "video unavailable", "content unavailable", "unsupported url", "removed",
+    )):
+        return "unavailable"
+    return default
+
+
 def is_retryable_download_timeout(returncode, diagnostics):
     return (
         returncode == FFMPEG_TIMEOUT_EXIT_CODE
@@ -186,9 +219,10 @@ def _job_duration(job):
 
 
 def _log_stage(job, stage):
-    with job["_process_lock"]:
-        if job.get("status") != "downloading" or job["_timed_out"].is_set():
+    with _job_lock(job):
+        if _job_stopped(job):
             return False
+        job["status"] = stage
         job["stage"] = stage
     logger.info("job_id=%s stage=%s", job["job_id"], stage)
     return True
@@ -214,21 +248,49 @@ def _timeout_minutes():
     return str(int(minutes)) if minutes.is_integer() else f"{minutes:g}"
 
 
-def _finish_error(job, message):
-    with job["_process_lock"]:
-        if job.get("status") in ("done", "error"):
+def _job_lock(job):
+    return job.get("_lock") or job["_process_lock"]
+
+
+def _event_is_set(job, key):
+    event = job.get(key)
+    return event is not None and event.is_set()
+
+
+def _job_stopped(job):
+    return (
+        job.get("status") in TERMINAL_JOB_STATUSES
+        or _event_is_set(job, "_timed_out")
+        or _event_is_set(job, "_cancelled")
+    )
+
+
+def _mark_downloading(job):
+    with _job_lock(job):
+        if _job_stopped(job):
+            return False
+        job["status"] = "downloading"
+        job["stage"] = "downloading"
+    logger.info("job_id=%s stage=downloading", job["job_id"])
+    return True
+
+
+def _finish_error(job, message, *, error_code="download_failed"):
+    with _job_lock(job):
+        if job.get("status") in TERMINAL_JOB_STATUSES:
             return False
         job["status"] = "error"
         job["stage"] = None
         job["error"] = message
+        job["error_code"] = error_code
     _log_result(job, "error")
     return True
 
 
 def _finish_done(job, *, file=None, file_path=None, filename=None):
     """Atomically finalize a job unless an earlier terminal state won the race."""
-    with job["_process_lock"]:
-        if job.get("status") != "downloading" or job["_timed_out"].is_set():
+    with _job_lock(job):
+        if _job_stopped(job) or job.get("status") not in {"downloading", "postprocessing"}:
             return False
         job["status"] = "done"
         job["stage"] = None
@@ -236,7 +298,25 @@ def _finish_done(job, *, file=None, file_path=None, filename=None):
             job["file"] = file
             job["file_path"] = file_path
             job["filename"] = filename
-        return True
+    return True
+
+
+def _finish_cancelled(job):
+    """Make cancellation terminal before stopping processes or deleting output."""
+    with _job_lock(job):
+        if job.get("status") == "cancelled":
+            return True
+        if job.get("status") in {"done", "error"}:
+            return False
+        job["_cancelled"].set()
+        job["status"] = "cancelled"
+        job["stage"] = None
+        process = job.get("_active_process") or job.get("_process")
+    if process is not None:
+        _terminate_process_group(process)
+    _cleanup_job_files(job["job_id"])
+    _log_result(job, "cancelled")
+    return True
 
 
 def _terminate_process_group(process):
@@ -255,8 +335,8 @@ def _terminate_process_group(process):
 
 def expire_job(job):
     """Stop the active process group and remove partial output at the job deadline."""
-    with job["_process_lock"]:
-        if job.get("status") in ("done", "error"):
+    with _job_lock(job):
+        if job.get("status") in TERMINAL_JOB_STATUSES:
             return
         job["_timed_out"].set()
         stage = job.get("stage") or "downloading"
@@ -265,7 +345,8 @@ def expire_job(job):
         job["error"] = (
             f"Job timed out after {_timeout_minutes()} minutes during {stage}."
         )
-        process = job.get("_active_process")
+        job["error_code"] = "job_timeout"
+        process = job.get("_active_process") or job.get("_process")
     logger.info("job_id=%s deadline_exceeded stage=%s", job["job_id"], stage)
     _log_result(job, "error")
     if process is not None:
@@ -274,18 +355,21 @@ def expire_job(job):
 
 
 def _start_job_process(job, command, **kwargs):
-    with job["_process_lock"]:
-        if job.get("status") in ("done", "error") or job["_timed_out"].is_set():
+    with _job_lock(job):
+        if _job_stopped(job):
             return None
         process = subprocess.Popen(command, start_new_session=True, **kwargs)
         job["_active_process"] = process
+        job["_process"] = process
     return process
 
 
 def _clear_job_process(job, process):
-    with job["_process_lock"]:
+    with _job_lock(job):
         if job.get("_active_process") is process:
             job["_active_process"] = None
+        if job.get("_process") is process:
+            job["_process"] = None
 
 
 def _run_job_process(job, command, *, capture_output=False):
@@ -307,12 +391,15 @@ def _run_job_process(job, command, *, capture_output=False):
 def _probe_job_info(job, url):
     result = _run_job_process(job, build_info_command(url, russian=True), capture_output=True)
     if result.returncode != 0:
-        return None
+        message = (result.stderr or "").strip().split("\n")[-1]
+        raise ValueError(message or "Failed to fetch localized video info")
     try:
         info = json.loads(result.stdout)
-        return info if isinstance(info, dict) else None
-    except (TypeError, json.JSONDecodeError):
-        return None
+    except (TypeError, json.JSONDecodeError) as error:
+        raise ValueError("Failed to parse localized video info") from error
+    if not isinstance(info, dict):
+        raise ValueError("Localized video info was not an object")
+    return info
 
 
 def _russian_audio_is_confirmed_unavailable(info, height):
@@ -327,15 +414,45 @@ def _russian_audio_is_confirmed_unavailable(info, height):
         return False
 
 
+def _acquire_download_slot(job):
+    queue_deadline = min(
+        time.monotonic() + QUEUE_WAIT_TIMEOUT,
+        job["_deadline_monotonic"],
+    )
+    while not _job_stopped(job):
+        now = time.monotonic()
+        if now >= job["_deadline_monotonic"]:
+            expire_job(job)
+            return False
+        if now >= queue_deadline:
+            _finish_error(
+                job,
+                "Too many concurrent downloads, please try again later",
+                error_code="busy",
+            )
+            return False
+        wait_for = min(SEMAPHORE_POLL_SECONDS, queue_deadline - now)
+        if download_semaphore.acquire(timeout=wait_for):
+            return True
+    return False
+
+
 def run_download(job_id, url, format_choice, format_id, audio_language=None, height=None):
     job = jobs[job_id]
 
-    if not download_semaphore.acquire(timeout=30):
-        _finish_error(job, "Too many concurrent downloads, please try again later")
+    if not _acquire_download_slot(job):
+        if _job_stopped(job):
+            return
+        _finish_error(
+            job,
+            "Too many concurrent downloads, please try again later",
+            error_code="busy",
+        )
         return
 
     try:
-        _do_download(job_id, url, format_choice, format_id, audio_language, height)
+        if _mark_downloading(job):
+            _do_download(job_id, url, format_choice, format_id, audio_language, height)
     finally:
         download_semaphore.release()
 
@@ -364,17 +481,40 @@ def _do_download(job_id, url, format_choice, format_id, audio_language=None, hei
     deadline_timer.start()
 
     try:
+        if _job_stopped(job):
+            deadline_timer.cancel()
+            return
         if audio_language == "ru":
-            info = _probe_job_info(job, url)
+            try:
+                info = _probe_job_info(job, url)
+            except Exception as error:
+                if not _job_stopped(job):
+                    message = str(error) or "Failed to fetch localized video info"
+                    _finish_error(
+                        job,
+                        message,
+                        error_code=classify_error_code(
+                            error, default="download_failed",
+                        ),
+                    )
+                deadline_timer.cancel()
+                return
+            if _job_stopped(job):
+                deadline_timer.cancel()
+                return
             if not russian_download_available(info or {}, height):
-                _finish_error(job, RUSSIAN_AUDIO_UNAVAILABLE_ERROR)
+                _finish_error(
+                    job,
+                    RUSSIAN_AUDIO_UNAVAILABLE_ERROR,
+                    error_code="russian_audio_unavailable",
+                )
                 deadline_timer.cancel()
                 return
 
         cmd = build_download_command(job_id, url, format_choice, format_id, audio_language, height)
         for attempt in range(len(DOWNLOAD_RETRY_DELAYS) + 1):
             returncode, stderr_lines = _run_download_attempt(job, cmd)
-            if returncode in (None, 0) or job["_timed_out"].is_set():
+            if returncode in (None, 0) or _job_stopped(job):
                 break
             if (
                 attempt == len(DOWNLOAD_RETRY_DELAYS)
@@ -389,15 +529,15 @@ def _do_download(job_id, url, format_choice, format_id, audio_language=None, hei
                 attempt + 1,
             )
             _cleanup_job_files(job_id)
-            if job["_timed_out"].wait(delay):
+            if job["_cancelled"].wait(delay) or job["_timed_out"].is_set():
                 break
     except Exception:
-        if not job["_timed_out"].is_set():
+        if not _job_stopped(job):
             _finish_error(job, "Download failed")
         deadline_timer.cancel()
         return
 
-    if job["_timed_out"].is_set():
+    if _job_stopped(job):
         deadline_timer.cancel()
         return
 
@@ -408,24 +548,30 @@ def _do_download(job_id, url, format_choice, format_id, audio_language=None, hei
     try:
         if returncode != 0:
             error = summarize_download_error(stderr_lines)
-            if audio_language == "ru" and not job["_timed_out"].is_set():
+            error_code = classify_error_code(error, default="download_failed")
+            if audio_language == "ru" and not _job_stopped(job):
                 try:
                     revalidated_info = _probe_job_info(job, url)
                 except Exception:
                     revalidated_info = None
                 if (
-                    not job["_timed_out"].is_set()
+                    not _job_stopped(job)
                     and _russian_audio_is_confirmed_unavailable(revalidated_info, height)
                 ):
                     error = RUSSIAN_AUDIO_UNAVAILABLE_ERROR
-            if not job["_timed_out"].is_set():
-                _finish_error(job, error)
+                    error_code = "russian_audio_unavailable"
+            if not _job_stopped(job):
+                _finish_error(job, error, error_code=error_code)
             deadline_timer.cancel()
             return
 
         files = glob.glob(os.path.join(DOWNLOAD_DIR, f"{job_id}.*"))
         if not files:
-            _finish_error(job, "Download completed but no file was found")
+            _finish_error(
+                job,
+                "Download completed but no file was found",
+                error_code="file_missing",
+            )
             deadline_timer.cancel()
             return
 
@@ -444,7 +590,9 @@ def _do_download(job_id, url, format_choice, format_id, audio_language=None, hei
                     pass
 
         if chosen.endswith(".mp4"):
-            _log_stage(job, "postprocessing")
+            if not _log_stage(job, "postprocessing"):
+                deadline_timer.cancel()
+                return
             try:
                 codec_probe = _run_job_process(
                     job,
@@ -453,6 +601,9 @@ def _do_download(job_id, url, format_choice, format_id, audio_language=None, hei
                      "-of", "default=noprint_wrappers=1:nokey=1", chosen],
                     capture_output=True,
                 )
+                if _job_stopped(job):
+                    deadline_timer.cancel()
+                    return
                 vcodec = (codec_probe.stdout or "").strip().lower()
             except Exception:
                 vcodec = ""
@@ -467,6 +618,9 @@ def _do_download(job_id, url, format_choice, format_id, audio_language=None, hei
                          "-movflags", "+faststart",
                          transcoded],
                     )
+                    if _job_stopped(job):
+                        deadline_timer.cancel()
+                        return
                     if r.returncode == 0 and os.path.exists(transcoded) and os.path.getsize(transcoded) > 0:
                         os.replace(transcoded, chosen)
                     elif os.path.exists(transcoded):
@@ -482,6 +636,9 @@ def _do_download(job_id, url, format_choice, format_id, audio_language=None, hei
                         ["ffmpeg", "-y", "-i", chosen, "-c", "copy",
                          "-movflags", "+faststart", faststart_tmp],
                     )
+                    if _job_stopped(job):
+                        deadline_timer.cancel()
+                        return
                     if os.path.exists(faststart_tmp) and os.path.getsize(faststart_tmp) > 0:
                         os.replace(faststart_tmp, chosen)
                     elif os.path.exists(faststart_tmp):
@@ -500,6 +657,9 @@ def _do_download(job_id, url, format_choice, format_id, audio_language=None, hei
                      "-of", "json", chosen],
                     capture_output=True,
                 )
+                if _job_stopped(job):
+                    deadline_timer.cancel()
+                    return
                 info = json.loads(probe.stdout)
                 stream = (info.get("streams") or [{}])[0]
                 fmt = info.get("format") or {}
@@ -527,8 +687,8 @@ def _do_download(job_id, url, format_choice, format_id, audio_language=None, hei
         if completed:
             _log_result(job, "done")
         deadline_timer.cancel()
-    except Exception as e:
-        if not job["_timed_out"].is_set():
+    except Exception:
+        if not _job_stopped(job):
             _finish_error(job, "Download failed")
         deadline_timer.cancel()
 
@@ -537,10 +697,12 @@ def _new_job(job_id, url, title):
     now = datetime.now(timezone.utc)
     started_monotonic = time.monotonic()
     deadline = now + timedelta(seconds=JOB_TIMEOUT)
+    lock = threading.Lock()
     return {
         "job_id": job_id,
-        "status": "downloading",
-        "stage": "downloading",
+        "status": "queued",
+        "stage": "queued",
+        "error_code": None,
         "url": url,
         "title": title,
         "started_at": now.isoformat(),
@@ -548,8 +710,11 @@ def _new_job(job_id, url, title):
         "_started_monotonic": started_monotonic,
         "_deadline_monotonic": started_monotonic + JOB_TIMEOUT,
         "_timed_out": threading.Event(),
-        "_process_lock": threading.Lock(),
+        "_cancelled": threading.Event(),
+        "_lock": lock,
+        "_process_lock": lock,
         "_active_process": None,
+        "_process": None,
     }
 
 
@@ -560,10 +725,10 @@ def index():
 
 @app.route("/api/info", methods=["POST"])
 def get_info():
-    data = request.json
+    data = request.get_json(silent=True) or {}
     url = data.get("url", "").strip()
     if not url:
-        return jsonify({"error": "No URL provided"}), 400
+        return jsonify({"error": "No URL provided", "error_code": "unavailable"}), 400
 
     try:
         info_deadline = time.monotonic() + INFO_REQUEST_TIMEOUT
@@ -606,14 +771,20 @@ def get_info():
             "russian_audio": russian_audio,
         })
     except subprocess.TimeoutExpired:
-        return jsonify({"error": "Timed out fetching video info"}), 400
+        return jsonify({
+            "error": "Timed out fetching video info",
+            "error_code": "info_timeout",
+        }), 400
     except Exception as e:
-        return jsonify({"error": str(e)}), 400
+        return jsonify({
+            "error": str(e),
+            "error_code": classify_error_code(e, default="unavailable"),
+        }), 400
 
 
 @app.route("/api/download", methods=["POST"])
 def start_download():
-    data = request.json
+    data = request.get_json(silent=True) or {}
     url = data.get("url", "").strip()
     format_choice = data.get("format", "video")
     format_id = data.get("format_id")
@@ -622,23 +793,23 @@ def start_download():
     height = data.get("height")
 
     if not url:
-        return jsonify({"error": "No URL provided"}), 400
+        return jsonify({"error": "No URL provided", "error_code": "unavailable"}), 400
     if audio_language not in (None, "ru"):
-        return jsonify({"error": "Unsupported audio_language"}), 400
+        return jsonify({"error": "Unsupported audio_language", "error_code": "format_unavailable"}), 400
     if height is not None and (isinstance(height, bool) or not isinstance(height, int) or height <= 0):
-        return jsonify({"error": "height must be a positive integer"}), 400
+        return jsonify({"error": "height must be a positive integer", "error_code": "format_unavailable"}), 400
     if audio_language == "ru" and not is_youtube_url(url):
-        return jsonify({"error": "Russian audio is only supported for YouTube URLs"}), 400
+        return jsonify({"error": "Russian audio is only supported for YouTube URLs", "error_code": "format_unavailable"}), 400
     if audio_language == "ru" and format_choice != "video":
-        return jsonify({"error": "Russian audio is only supported for video downloads"}), 400
+        return jsonify({"error": "Russian audio is only supported for video downloads", "error_code": "format_unavailable"}), 400
     if audio_language == "ru" and format_id is not None:
-        return jsonify({"error": "format_id is not accepted for Russian audio"}), 400
+        return jsonify({"error": "format_id is not accepted for Russian audio", "error_code": "format_unavailable"}), 400
 
     job_id = uuid.uuid4().hex[:10]
     jobs[job_id] = _new_job(job_id, url, title)
     jobs[job_id]["_audio_language"] = audio_language
     jobs[job_id]["_requested_height"] = height
-    logger.info("job_id=%s stage=downloading", job_id)
+    logger.info("job_id=%s stage=queued", job_id)
 
     thread = threading.Thread(
         target=run_download,
@@ -654,13 +825,14 @@ def start_download():
 def check_status(job_id):
     job = jobs.get(job_id)
     if not job:
-        return jsonify({"error": "Job not found"}), 404
+        return jsonify({"error": "Job not found", "error_code": "unavailable"}), 404
     return jsonify({
         "status": job["status"],
         "stage": job.get("stage"),
         "started_at": job.get("started_at"),
         "deadline_at": job.get("deadline_at"),
         "error": job.get("error"),
+        "error_code": job.get("error_code"),
         "filename": job.get("filename"),
         "progress": job.get("progress"),
         "file_path": job.get("file_path"),
@@ -670,11 +842,26 @@ def check_status(job_id):
     })
 
 
+@app.route("/api/cancel/<job_id>", methods=["POST"])
+def cancel_job(job_id):
+    job = jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "Job not found"}), 404
+    if not _finish_cancelled(job):
+        return jsonify({
+            "job_id": job_id,
+            "status": job["status"],
+            "error": "Job already finished",
+            "error_code": job.get("error_code") or "download_failed",
+        }), 409
+    return jsonify({"job_id": job_id, "status": "cancelled"})
+
+
 @app.route("/api/file/<job_id>")
 def download_file(job_id):
     job = jobs.get(job_id)
     if not job or job["status"] != "done":
-        return jsonify({"error": "File not ready"}), 404
+        return jsonify({"error": "File not ready", "error_code": "file_missing"}), 404
     return send_file(job["file"], as_attachment=True, download_name=job["filename"])
 
 

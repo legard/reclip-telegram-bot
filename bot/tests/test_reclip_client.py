@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, patch
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+import reclip_client
 from reclip_client import (
     get_info,
     start_download,
@@ -265,7 +266,73 @@ class TestPollStatus:
                 await poll_status("abc1234567")
 
 
+class TestCancelDownload:
+    @pytest.mark.asyncio
+    async def test_success_posts_job_id_and_returns_cancelled_status(self, mock_response):
+        response = mock_response(200, {"job_id": "job-1", "status": "cancelled"})
+        with patch("reclip_client._client") as factory:
+            client = AsyncMock()
+            client.__aenter__ = AsyncMock(return_value=client)
+            client.__aexit__ = AsyncMock(return_value=False)
+            client.post = AsyncMock(return_value=response)
+            factory.return_value = client
+
+            result = await reclip_client.cancel_download("job-1")
+
+        assert result == {"job_id": "job-1", "status": "cancelled"}
+        client.post.assert_awaited_once_with("/api/cancel/job-1", timeout=10.0)
+
+    @pytest.mark.asyncio
+    async def test_unknown_job_raises_job_lost(self, mock_response):
+        response = mock_response(404, {"error": "Job not found"})
+        with patch("reclip_client._client") as factory:
+            client = AsyncMock()
+            client.__aenter__ = AsyncMock(return_value=client)
+            client.__aexit__ = AsyncMock(return_value=False)
+            client.post = AsyncMock(return_value=response)
+            factory.return_value = client
+
+            with pytest.raises(ReclipJobLost):
+                await reclip_client.cancel_download("missing")
+
+    @pytest.mark.asyncio
+    async def test_terminal_conflict_preserves_server_error_code(self, mock_response):
+        response = mock_response(
+            409,
+            {"error": "Job already finished", "error_code": "download_failed"},
+        )
+        with patch("reclip_client._client") as factory:
+            client = AsyncMock()
+            client.__aenter__ = AsyncMock(return_value=client)
+            client.__aexit__ = AsyncMock(return_value=False)
+            client.post = AsyncMock(return_value=response)
+            factory.return_value = client
+
+            with pytest.raises(ReclipDownloadError) as caught:
+                await reclip_client.cancel_download("job-1")
+
+        assert caught.value.error_code == "download_failed"
+
+
 class TestWaitForJob:
+    @pytest.mark.asyncio
+    async def test_cancelled_is_terminal(self, monkeypatch):
+        calls = 0
+
+        async def cancelled(job_id, *, timeout):
+            nonlocal calls
+            calls += 1
+            if calls > 1:
+                pytest.fail("cancelled status was polled again")
+            return {"job_id": job_id, "status": "cancelled"}
+
+        monkeypatch.setattr("reclip_client.poll_status", cancelled)
+
+        result = await wait_for_job("job-1", sleep=AsyncMock())
+
+        assert result["status"] == "cancelled"
+        assert calls == 1
+
     @pytest.mark.asyncio
     async def test_outer_deadline_cancels_a_poll_that_exceeds_its_request_budget(self, monkeypatch):
         poll_timeouts = []

@@ -145,6 +145,31 @@ async def poll_status(job_id: str, *, timeout: float = 10.0) -> dict:
         raise ReclipError(f"Status request failed: {e}")
 
 
+async def cancel_download(job_id: str) -> dict:
+    try:
+        async with _client() as client:
+            resp = await client.post(f"/api/cancel/{job_id}", timeout=10.0)
+            resp.raise_for_status()
+            return resp.json()
+    except httpx.ConnectError:
+        raise ReclipServiceDown("Cannot reach reclip service")
+    except httpx.TimeoutException:
+        raise ReclipError("Cancel request timed out", error_code="network")
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            raise ReclipJobLost(ReclipJobLost.message)
+        raise ReclipDownloadError(
+            f"Cancel request failed: {e.response.status_code}",
+            error_code=_response_error_code(e.response, "download_failed"),
+        )
+    except (ValueError, TypeError) as e:
+        raise ReclipDownloadError(f"Malformed cancel response: {e}")
+    except ReclipError:
+        raise
+    except Exception as e:
+        raise ReclipDownloadError(f"Cancel request failed: {e}")
+
+
 def _deadline_timestamp(value: str | None) -> float | None:
     if not value:
         return None
@@ -216,7 +241,7 @@ async def wait_for_job(
             if inspect.isawaitable(callback_result):
                 await callback_result
 
-        if status.get("status") in ("done", "error"):
+        if status.get("status") in ("done", "error", "cancelled"):
             return status
 
         remaining_deadline = deadline + JOB_DEADLINE_GRACE_SECONDS - wall_clock()

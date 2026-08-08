@@ -729,7 +729,9 @@ def test_download_slot_is_released_after_job_finishes(monkeypatch):
             self.released += 1
 
     semaphore = Semaphore()
-    app.jobs["job-1"] = {"status": "downloading"}
+    app.jobs["job-1"] = app._new_job(
+        "job-1", "https://example.com/video", "Video",
+    )
     monkeypatch.setattr(app, "download_semaphore", semaphore)
     monkeypatch.setattr(app, "_do_download", lambda *args: None)
 
@@ -775,3 +777,488 @@ def test_download_start_failure_finalizes_job_and_cancels_deadline_timer(monkeyp
 
     assert job["status"] == "error"
     assert job["error"] == "Download failed"
+
+
+def test_download_endpoint_creates_a_queued_job(monkeypatch):
+    class Thread:
+        daemon = False
+
+        def __init__(self, *, target, args):
+            self.target = target
+            self.args = args
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(app.threading, "Thread", Thread)
+
+    response = app.app.test_client().post(
+        "/api/download",
+        json={"url": "https://example.com/video", "format": "video"},
+    )
+    job_id = response.get_json()["job_id"]
+
+    try:
+        assert app.jobs[job_id]["status"] == "queued"
+        assert app.jobs[job_id]["stage"] == "queued"
+        assert app.jobs[job_id]["error_code"] is None
+        assert app.jobs[job_id]["_cancelled"].is_set() is False
+    finally:
+        app.jobs.pop(job_id, None)
+
+
+def test_worker_marks_job_downloading_only_after_acquiring_slot(monkeypatch):
+    observed = []
+
+    class Semaphore:
+        def acquire(self, timeout):
+            observed.append(("acquire", app.jobs["job-1"]["status"]))
+            return True
+
+        def release(self):
+            observed.append(("release", app.jobs["job-1"]["status"]))
+
+    job = app._new_job("job-1", "https://example.com/video", "Video")
+    app.jobs["job-1"] = job
+    monkeypatch.setattr(app, "download_semaphore", Semaphore())
+    monkeypatch.setattr(
+        app,
+        "_do_download",
+        lambda *args: observed.append(("download", job["status"])),
+    )
+
+    try:
+        app.run_download("job-1", "https://example.com/video", "video", None)
+    finally:
+        app.jobs.pop("job-1", None)
+
+    assert observed == [
+        ("acquire", "queued"),
+        ("download", "downloading"),
+        ("release", "downloading"),
+    ]
+
+
+def test_cancel_queued_job_is_idempotent():
+    job = app._new_job("job-1", "https://example.com/video", "Video")
+    app.jobs["job-1"] = job
+
+    try:
+        first = app.app.test_client().post("/api/cancel/job-1")
+        second = app.app.test_client().post("/api/cancel/job-1")
+    finally:
+        app.jobs.pop("job-1", None)
+
+    assert first.status_code == 200
+    assert first.get_json() == {"job_id": "job-1", "status": "cancelled"}
+    assert second.status_code == 200
+    assert second.get_json() == {"job_id": "job-1", "status": "cancelled"}
+    assert job["_cancelled"].is_set()
+
+
+def test_cancel_racing_with_semaphore_acquire_releases_slot_without_downloading(monkeypatch):
+    calls = []
+    job = app._new_job("job-1", "https://example.com/video", "Video")
+    app.jobs["job-1"] = job
+
+    class Semaphore:
+        def acquire(self, timeout):
+            app._finish_cancelled(job)
+            calls.append("acquired")
+            return True
+
+        def release(self):
+            calls.append("released")
+
+    monkeypatch.setattr(app, "download_semaphore", Semaphore())
+    monkeypatch.setattr(
+        app,
+        "_do_download",
+        lambda *args: pytest.fail("cancelled queued job must not download"),
+    )
+
+    try:
+        app.run_download("job-1", "https://example.com/video", "video", None)
+    finally:
+        app.jobs.pop("job-1", None)
+
+    assert calls == ["acquired", "released"]
+    assert job["status"] == "cancelled"
+
+
+def test_queue_wait_checks_for_cancellation_at_short_intervals(monkeypatch):
+    timeouts = []
+    job = app._new_job("job-1", "https://example.com/video", "Video")
+    app.jobs["job-1"] = job
+
+    class Semaphore:
+        def acquire(self, timeout):
+            timeouts.append(timeout)
+            app._finish_cancelled(job)
+            return False
+
+        def release(self):
+            pytest.fail("a slot that was not acquired must not be released")
+
+    monkeypatch.setattr(app, "download_semaphore", Semaphore())
+
+    try:
+        app.run_download("job-1", "https://example.com/video", "video", None)
+    finally:
+        app.jobs.pop("job-1", None)
+
+    assert timeouts and timeouts[0] <= 0.25
+    assert job["status"] == "cancelled"
+
+
+def test_job_deadline_expires_while_waiting_for_semaphore(monkeypatch):
+    clock = [100.0]
+
+    class Semaphore:
+        def acquire(self, timeout):
+            clock[0] += timeout
+            return False
+
+        def release(self):
+            pytest.fail("a slot that was not acquired must not be released")
+
+    monkeypatch.setattr(app.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(app, "JOB_TIMEOUT", 0.2)
+    monkeypatch.setattr(app, "download_semaphore", Semaphore())
+    job = app._new_job("job-1", "https://example.com/video", "Video")
+    app.jobs["job-1"] = job
+
+    try:
+        app.run_download("job-1", "https://example.com/video", "video", None)
+    finally:
+        app.jobs.pop("job-1", None)
+
+    assert job["status"] == "error"
+    assert job["error_code"] == "job_timeout"
+    assert clock[0] == pytest.approx(100.2)
+
+
+@pytest.mark.parametrize("status", ["downloading", "postprocessing"])
+def test_cancel_active_job_terminates_process_group_and_cleans_files(
+    monkeypatch, tmp_path, status,
+):
+    process = SimpleNamespace(pid=4242)
+    signals = []
+    job = app._new_job("job-1", "https://example.com/video", "Video")
+    job.update(status=status, stage=status, _active_process=process)
+    app.jobs["job-1"] = job
+    monkeypatch.setattr(app, "DOWNLOAD_DIR", str(tmp_path))
+    monkeypatch.setattr(app.os, "killpg", lambda pid, sig: signals.append((pid, sig)))
+    monkeypatch.setattr(app.time, "sleep", lambda seconds: None)
+    (tmp_path / "job-1.mp4").write_text("partial")
+    (tmp_path / "job-1.part").write_text("partial")
+    (tmp_path / "other.mp4").write_text("keep")
+
+    try:
+        response = app.app.test_client().post("/api/cancel/job-1")
+    finally:
+        app.jobs.pop("job-1", None)
+
+    assert response.status_code == 200
+    assert job["status"] == "cancelled"
+    assert job["stage"] is None
+    assert signals == [(4242, app.signal.SIGTERM), (4242, app.signal.SIGKILL)]
+    assert not (tmp_path / "job-1.mp4").exists()
+    assert not (tmp_path / "job-1.part").exists()
+    assert (tmp_path / "other.mp4").exists()
+
+
+def test_cancelled_job_cannot_start_a_later_process(monkeypatch):
+    job = app._new_job("job-1", "https://example.com/video", "Video")
+    app._finish_cancelled(job)
+    monkeypatch.setattr(
+        app.subprocess,
+        "Popen",
+        lambda *args, **kwargs: pytest.fail("cancelled job started a process"),
+    )
+
+    assert app._start_job_process(job, ["ffmpeg", "-version"]) is None
+
+
+def test_late_process_return_cannot_overwrite_cancelled_job():
+    job = app._new_job("job-1", "https://example.com/video", "Video")
+    job.update(status="downloading", stage="downloading")
+
+    assert app._finish_cancelled(job) is True
+    assert app._finish_done(job, file="late.mp4", filename="late.mp4") is False
+    assert app._finish_error(job, "late failure") is False
+
+    assert job["status"] == "cancelled"
+    assert "file" not in job
+    assert "error" not in job
+
+
+def test_cancel_unknown_job_is_404_and_completed_jobs_are_409(tmp_path):
+    client = app.app.test_client()
+    done = app._new_job("done-job", "https://example.com/video", "Video")
+    done.update(status="done", stage=None, file=str(tmp_path / "done.mp4"))
+    failed = app._new_job("failed-job", "https://example.com/video", "Video")
+    failed.update(status="error", stage=None, error="failed", error_code="download_failed")
+    app.jobs.update({"done-job": done, "failed-job": failed})
+
+    try:
+        missing_response = client.post("/api/cancel/missing-job")
+        done_response = client.post("/api/cancel/done-job")
+        failed_response = client.post("/api/cancel/failed-job")
+    finally:
+        app.jobs.pop("done-job", None)
+        app.jobs.pop("failed-job", None)
+
+    assert missing_response.status_code == 404
+    assert done_response.status_code == 409
+    assert done_response.get_json()["status"] == "done"
+    assert failed_response.status_code == 409
+    assert failed_response.get_json()["status"] == "error"
+
+
+def test_status_exposes_cancelled_and_stable_error_code():
+    job = app._new_job("job-1", "https://example.com/video", "Video")
+    app.jobs["job-1"] = job
+    app._finish_cancelled(job)
+
+    try:
+        cancelled_response = app.app.test_client().get("/api/status/job-1")
+        job["status"] = "error"
+        job["error"] = "No output file"
+        job["error_code"] = "file_missing"
+        error_response = app.app.test_client().get("/api/status/job-1")
+    finally:
+        app.jobs.pop("job-1", None)
+
+    assert cancelled_response.get_json()["status"] == "cancelled"
+    assert cancelled_response.get_json()["error_code"] is None
+    assert error_response.get_json()["error_code"] == "file_missing"
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_code"),
+    [
+        (app.subprocess.TimeoutExpired("yt-dlp", 55), "info_timeout"),
+        (ValueError("Sign in to confirm your age"), "auth_required"),
+        (ConnectionError("Connection reset by peer"), "network"),
+        (ValueError("Unsupported URL"), "unavailable"),
+    ],
+)
+def test_info_endpoint_returns_stable_error_codes(monkeypatch, error, expected_code):
+    def fail(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(app, "fetch_info", fail)
+
+    response = app.app.test_client().post(
+        "/api/info", json={"url": "https://example.com/video"},
+    )
+
+    assert response.status_code == 400
+    assert response.get_json()["error_code"] == expected_code
+    assert response.get_json()["error"]
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "payload", "expected_code"),
+    [
+        ("post", "/api/info", {}, "unavailable"),
+        (
+            "post",
+            "/api/download",
+            {"url": "https://example.com/video", "audio_language": "de"},
+            "format_unavailable",
+        ),
+        ("get", "/api/status/missing-job", None, "unavailable"),
+    ],
+)
+def test_api_error_payloads_include_stable_codes(method, path, payload, expected_code):
+    client_method = getattr(app.app.test_client(), method)
+
+    response = client_method(path, json=payload) if payload is not None else client_method(path)
+
+    assert response.status_code >= 400
+    assert response.get_json()["error_code"] == expected_code
+
+
+@pytest.mark.parametrize(
+    ("diagnostics", "expected_code"),
+    [
+        (["ERROR: Sign in to confirm you're not a bot"], "auth_required"),
+        (["ERROR: Unable to download webpage: Connection timed out"], "network"),
+        (["ERROR: Requested format is not available"], "format_unavailable"),
+        (["ERROR: ffmpeg exited with code 8"], "download_failed"),
+    ],
+)
+def test_failed_download_status_has_classified_error_code(
+    monkeypatch, diagnostics, expected_code,
+):
+    class Timer:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+        def cancel(self):
+            pass
+
+    job = app._new_job("job-1", "https://example.com/video", "Video")
+    job.update(status="downloading", stage="downloading")
+    app.jobs["job-1"] = job
+    monkeypatch.setattr(app.threading, "Timer", Timer)
+    monkeypatch.setattr(
+        app,
+        "_run_download_attempt",
+        lambda current_job, command: (1, deque(diagnostics)),
+    )
+
+    try:
+        app._do_download("job-1", "https://example.com/video", "video", None)
+        response = app.app.test_client().get("/api/status/job-1")
+    finally:
+        app.jobs.pop("job-1", None)
+
+    assert response.get_json()["error_code"] == expected_code
+
+
+@pytest.mark.parametrize(
+    ("diagnostic", "expected_code"),
+    [
+        ("ERROR: Sign in to confirm you're not a bot", "auth_required"),
+        ("ERROR: Unable to download webpage: Connection timed out", "network"),
+        ("ERROR: Video unavailable", "unavailable"),
+        ("ERROR: extractor crashed", "download_failed"),
+    ],
+)
+def test_russian_preflight_preserves_and_classifies_probe_failure(
+    monkeypatch, diagnostic, expected_code,
+):
+    class Timer:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+        def cancel(self):
+            pass
+
+    job = app._new_job("job-1", "https://youtu.be/x", "Video")
+    job.update(status="downloading", stage="downloading")
+    app.jobs["job-1"] = job
+    monkeypatch.setattr(app.threading, "Timer", Timer)
+    monkeypatch.setattr(
+        app,
+        "_run_job_process",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=1, stdout="", stderr=diagnostic,
+        ),
+    )
+    monkeypatch.setattr(
+        app,
+        "build_download_command",
+        lambda *args, **kwargs: pytest.fail("preflight failure must stop download"),
+    )
+
+    try:
+        app._do_download("job-1", "https://youtu.be/x", "video", None, "ru", 720)
+    finally:
+        app.jobs.pop("job-1", None)
+
+    assert job["status"] == "error"
+    assert job["error"] == diagnostic
+    assert job["error_code"] == expected_code
+
+
+def test_busy_timeout_missing_file_and_russian_audio_have_stable_codes(monkeypatch, tmp_path):
+    clock = [100.0]
+
+    class UnavailableSemaphore:
+        def acquire(self, timeout):
+            clock[0] += timeout
+            return False
+
+    monkeypatch.setattr(app.time, "monotonic", lambda: clock[0])
+    busy = app._new_job("busy", "https://example.com/video", "Video")
+    app.jobs["busy"] = busy
+    monkeypatch.setattr(app, "download_semaphore", UnavailableSemaphore())
+    app.run_download("busy", "https://example.com/video", "video", None)
+
+    timed_out = app._new_job("timed-out", "https://example.com/video", "Video")
+    timed_out.update(status="downloading", stage="downloading")
+    app.expire_job(timed_out)
+
+    missing = app._new_job("missing", "https://example.com/video", "Video")
+    missing.update(status="downloading", stage="downloading")
+    russian = app._new_job("russian", "https://youtu.be/x", "Video")
+    russian.update(status="downloading", stage="downloading")
+
+    class Timer:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+        def cancel(self):
+            pass
+
+    monkeypatch.setattr(app, "DOWNLOAD_DIR", str(tmp_path))
+    monkeypatch.setattr(app.threading, "Timer", Timer)
+    monkeypatch.setattr(app, "_run_download_attempt", lambda job, command: (0, deque()))
+    monkeypatch.setattr(app, "_probe_job_info", lambda job, url: {"formats": []})
+    app.jobs["missing"] = missing
+    app.jobs["russian"] = russian
+    app._do_download("missing", "https://example.com/video", "video", None)
+    app._do_download("russian", "https://youtu.be/x", "video", None, "ru", 720)
+
+    try:
+        assert busy["error_code"] == "busy"
+        assert timed_out["error_code"] == "job_timeout"
+        assert missing["error_code"] == "file_missing"
+        assert russian["error_code"] == "russian_audio_unavailable"
+    finally:
+        app.jobs.pop("busy", None)
+        app.jobs.pop("missing", None)
+        app.jobs.pop("russian", None)
+
+
+def test_cancellation_during_ffmpeg_cannot_publish_postprocessed_file(monkeypatch, tmp_path):
+    class Timer:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+        def cancel(self):
+            pass
+
+    chosen = tmp_path / "job-1.mp4"
+    chosen.write_text("video")
+    job = app._new_job("job-1", "https://example.com/video", "Video")
+    job.update(status="downloading", stage="downloading")
+    app.jobs["job-1"] = job
+
+    def run_process(current_job, command, *, capture_output=False):
+        if command[0] == "ffprobe":
+            return SimpleNamespace(returncode=0, stdout="vp9\n", stderr="")
+        assert command[0] == "ffmpeg"
+        (tmp_path / "job-1.mp4.h264.mp4").write_text("transcoded")
+        app._finish_cancelled(current_job)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(app, "DOWNLOAD_DIR", str(tmp_path))
+    monkeypatch.setattr(app.threading, "Timer", Timer)
+    monkeypatch.setattr(app, "_run_download_attempt", lambda current_job, command: (0, deque()))
+    monkeypatch.setattr(app, "_run_job_process", run_process)
+
+    try:
+        app._do_download("job-1", "https://example.com/video", "video", None)
+    finally:
+        app.jobs.pop("job-1", None)
+
+    assert job["status"] == "cancelled"
+    assert "file" not in job
+    assert list(tmp_path.glob("job-1.*")) == []
