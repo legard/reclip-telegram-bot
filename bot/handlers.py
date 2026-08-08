@@ -1,4 +1,5 @@
 import asyncio
+from functools import wraps
 import hashlib
 import logging
 import os
@@ -23,6 +24,7 @@ from reclip_client import (
 )
 import event_client
 from upload import TelegramUploadError, send_local_path
+from preferences import PreferenceStore
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +32,10 @@ DOWNLOADS_PATH = os.environ.get("DOWNLOADS_PATH", "/downloads")
 URL_REGEX = re.compile(r"https?://[^\s<>\"']+")
 STATE_TTL = 600  # 10 minutes
 CAPTION_MAX = 1000  # Telegram caption limit is 1024, leave headroom
+
+
+def allowed_user_filter(ids: frozenset[int]):
+    return filters.User(user_id=ids)
 
 
 def _truncate_caption(text: str) -> str:
@@ -171,9 +177,14 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text)
 
 
-async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_settings(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    preference_store: PreferenceStore | None = None,
+):
     uid = update.effective_user.id
-    prefs = _user_prefs.get(uid, {})
+    prefs = await preference_store.get(uid) if preference_store else _user_prefs.get(uid, {})
+    prefs = prefs or {}
     quality = prefs.get("quality", "best")
     fmt = prefs.get("format", "video")
     text = (
@@ -187,7 +198,11 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text)
 
 
-async def cmd_setquality(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_setquality(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    preference_store: PreferenceStore | None = None,
+):
     uid = update.effective_user.id
     if not context.args:
         await update.message.reply_text("Usage: /setquality <best/1080/720/480/360>")
@@ -197,11 +212,24 @@ async def cmd_setquality(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if q not in valid:
         await update.message.reply_text(f"Invalid quality. Options: {', '.join(valid)}")
         return
-    _user_prefs.setdefault(uid, {})["quality"] = q
+    if preference_store:
+        prefs = await preference_store.get(uid) or {}
+        await preference_store.save(
+            uid,
+            format=prefs.get("format", "video"),
+            quality=q,
+            audio_mode=prefs.get("audio_mode", "original"),
+        )
+    else:
+        _user_prefs.setdefault(uid, {})["quality"] = q
     await update.message.reply_text(f"Default quality set to: {q}")
 
 
-async def cmd_setformat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_setformat(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    preference_store: PreferenceStore | None = None,
+):
     uid = update.effective_user.id
     if not context.args:
         await update.message.reply_text("Usage: /setformat <video/audio>")
@@ -210,7 +238,16 @@ async def cmd_setformat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if f not in ("video", "audio"):
         await update.message.reply_text("Invalid format. Options: video, audio")
         return
-    _user_prefs.setdefault(uid, {})["format"] = f
+    if preference_store:
+        prefs = await preference_store.get(uid) or {}
+        await preference_store.save(
+            uid,
+            format=f,
+            quality=prefs.get("quality", "best"),
+            audio_mode=prefs.get("audio_mode", "original"),
+        )
+    else:
+        _user_prefs.setdefault(uid, {})["format"] = f
     await update.message.reply_text(f"Default format set to: {f}")
 
 
@@ -794,19 +831,45 @@ async def _edit_safe(message, text: str):
         logger.debug("Failed to edit message with: %s", text)
 
 
-def register_handlers(application):
-    application.add_handler(CommandHandler("start", cmd_start))
-    application.add_handler(CommandHandler("help", cmd_help))
-    application.add_handler(CommandHandler("platforms", cmd_platforms))
-    application.add_handler(CommandHandler("stats", cmd_stats))
-    application.add_handler(CommandHandler("settings", cmd_settings))
-    application.add_handler(CommandHandler("setquality", cmd_setquality))
-    application.add_handler(CommandHandler("setformat", cmd_setformat))
-    application.add_handler(CommandHandler("mp3", cmd_mp3))
-    application.add_handler(CommandHandler("mp4", cmd_mp4))
-    application.add_handler(CommandHandler("best", cmd_best))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, url_handler))
-    application.add_handler(CallbackQueryHandler(format_callback, pattern=r"^fmt:"))
-    application.add_handler(CallbackQueryHandler(quality_callback, pattern=r"^qty:"))
-    application.add_handler(CallbackQueryHandler(russian_quality_callback, pattern=r"^ruqty:"))
-    application.add_handler(CallbackQueryHandler(cancel_callback, pattern=r"^cancel:"))
+def _with_preferences(callback, preference_store: PreferenceStore | None):
+    @wraps(callback)
+    async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        return await callback(update, context, preference_store)
+
+    return wrapped
+
+
+def _authorized_callback(callback, allowed_user_ids: frozenset[int]):
+    @wraps(callback)
+    async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        user = update.effective_user or query.from_user
+        if user is None or user.id not in allowed_user_ids:
+            await query.answer()
+            return
+        return await callback(update, context)
+
+    return wrapped
+
+
+def register_handlers(
+    application,
+    preference_store: PreferenceStore | None,
+    allowed_user_ids: frozenset[int],
+):
+    allowed = allowed_user_filter(allowed_user_ids)
+    application.add_handler(CommandHandler("start", cmd_start, filters=allowed))
+    application.add_handler(CommandHandler("help", cmd_help, filters=allowed))
+    application.add_handler(CommandHandler("platforms", cmd_platforms, filters=allowed))
+    application.add_handler(CommandHandler("stats", cmd_stats, filters=allowed))
+    application.add_handler(CommandHandler("settings", _with_preferences(cmd_settings, preference_store), filters=allowed))
+    application.add_handler(CommandHandler("setquality", _with_preferences(cmd_setquality, preference_store), filters=allowed))
+    application.add_handler(CommandHandler("setformat", _with_preferences(cmd_setformat, preference_store), filters=allowed))
+    application.add_handler(CommandHandler("mp3", cmd_mp3, filters=allowed))
+    application.add_handler(CommandHandler("mp4", cmd_mp4, filters=allowed))
+    application.add_handler(CommandHandler("best", cmd_best, filters=allowed))
+    application.add_handler(MessageHandler(allowed & filters.TEXT & ~filters.COMMAND, url_handler))
+    application.add_handler(CallbackQueryHandler(_authorized_callback(format_callback, allowed_user_ids), pattern=r"^fmt:"))
+    application.add_handler(CallbackQueryHandler(_authorized_callback(quality_callback, allowed_user_ids), pattern=r"^qty:"))
+    application.add_handler(CallbackQueryHandler(_authorized_callback(russian_quality_callback, allowed_user_ids), pattern=r"^ruqty:"))
+    application.add_handler(CallbackQueryHandler(_authorized_callback(cancel_callback, allowed_user_ids), pattern=r"^cancel:"))

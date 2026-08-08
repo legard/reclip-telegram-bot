@@ -74,6 +74,7 @@ cp .env.example .env
 3. Edit `.env` with your credentials:
 ```bash
 BOT_TOKEN=your-bot-token-from-botfather
+ALLOWED_USER_IDS=123456789
 TELEGRAM_API_ID=your-api-id
 TELEGRAM_API_HASH=your-api-hash
 ```
@@ -103,6 +104,8 @@ All configuration is via environment variables in `.env`:
 | Variable | Default | Description |
 |---|---|---|
 | `BOT_TOKEN` | (required) | Telegram bot token from @BotFather |
+| `ALLOWED_USER_IDS` | (required) | Comma-separated Telegram user IDs allowed to use the private bot |
+| `BOT_DB_PATH` | `/data/bot.db` | Separate SQLite database for durable bot preferences |
 | `TELEGRAM_API_ID` | (required) | Telegram API ID from my.telegram.org |
 | `TELEGRAM_API_HASH` | (required) | Telegram API hash from my.telegram.org |
 | `MAX_CONCURRENT_DOWNLOADS` | 3 | Max parallel downloads |
@@ -175,7 +178,7 @@ POT_PROVIDER_URL=http://localhost:4416 python app.py &
 
 # Start the bot
 cd bot && pip install -r requirements.txt
-BOT_TOKEN=your-token RECLIP_URL=http://localhost:8899 DOWNLOADS_PATH=../reclip/downloads python bot.py
+BOT_TOKEN=your-token ALLOWED_USER_IDS=123456789 RECLIP_URL=http://localhost:8899 DOWNLOADS_PATH=../reclip/downloads python bot.py
 ```
 
 ### Project structure

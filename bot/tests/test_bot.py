@@ -2,10 +2,14 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from types import SimpleNamespace
+
+import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import bot
+import handlers
 
 
 def test_build_application_enables_local_mode():
@@ -14,6 +18,53 @@ def test_build_application_enables_local_mode():
     assert application.bot.local_mode is True
     assert application.bot.base_url == "http://telegram-bot-api:8081/bot123456:test-token"
     assert application.bot.base_file_url == "http://telegram-bot-api:8081/file/bot123456:test-token"
+
+
+def test_parse_allowed_user_ids_rejects_empty_and_invalid_values():
+    with pytest.raises(ValueError):
+        bot.parse_allowed_user_ids("")
+    with pytest.raises(ValueError):
+        bot.parse_allowed_user_ids("12,nope")
+
+
+def test_allowed_user_filter_matches_only_configured_user_ids():
+    allowed = bot.allowed_user_filter(frozenset({12}))
+
+    assert allowed.filter(SimpleNamespace(from_user=SimpleNamespace(id=12))) is True
+    assert allowed.filter(SimpleNamespace(from_user=SimpleNamespace(id=99))) is False
+
+
+@pytest.mark.asyncio
+async def test_unauthorized_callback_is_answered_without_handler_side_effect():
+    registered = []
+
+    class Application:
+        def add_handler(self, handler):
+            registered.append(handler)
+
+    class Query:
+        def __init__(self):
+            self.data = "fmt:7:abcd:audio"
+            self.from_user = SimpleNamespace(id=99)
+            self.message = SimpleNamespace(chat_id=10, message_id=7, photo=False)
+            self.answer_count = 0
+
+        async def answer(self):
+            self.answer_count += 1
+
+    handlers._state[handlers._state_key(10, 7, "abcd")] = {"created": 0}
+    handlers.register_handlers(Application(), preference_store=None, allowed_user_ids=frozenset({12}))
+    callback = next(
+        handler.callback
+        for handler in registered
+        if isinstance(handler, handlers.CallbackQueryHandler) and handler.pattern.pattern == "^fmt:"
+    )
+    query = Query()
+
+    await callback(SimpleNamespace(callback_query=query, effective_user=query.from_user), None)
+
+    assert query.answer_count == 1
+    assert handlers._state[handlers._state_key(10, 7, "abcd")] == {"created": 0}
 
 
 def test_configure_logging_suppresses_http_clients_and_redacts_token():

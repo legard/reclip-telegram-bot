@@ -379,14 +379,14 @@ def test_register_handlers_registers_selection_callbacks():
         def add_handler(self, handler):
             registered.append(handler)
 
-    handlers.register_handlers(Application())
+    handlers.register_handlers(Application(), preference_store=None, allowed_user_ids=frozenset({1}))
 
     callbacks = [
         handler for handler in registered
         if isinstance(handler, handlers.CallbackQueryHandler)
     ]
 
-    assert {(handler.pattern.pattern, handler.callback) for handler in callbacks} == {
+    assert {(handler.pattern.pattern, handler.callback.__wrapped__) for handler in callbacks} == {
         ("^fmt:", handlers.format_callback),
         ("^qty:", handlers.quality_callback),
         ("^ruqty:", handlers.russian_quality_callback),

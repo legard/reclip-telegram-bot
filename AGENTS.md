@@ -39,7 +39,7 @@ ADMIN_PASSWORD=changeme DB_PATH=./reclip.db \
 cd bot
 pip install -r requirements.txt
 BOT_TOKEN=<token> RECLIP_URL=http://localhost:8899 \
-  DOWNLOADS_PATH=../reclip/downloads python bot.py
+  ALLOWED_USER_IDS=<your-telegram-user-id> DOWNLOADS_PATH=../reclip/downloads python bot.py
 ```
 
 The ReClip runtime contract is Deno >= 2.3.0 in `PATH`, bundled EJS and the
@@ -107,6 +107,7 @@ Background asyncio task that runs every `CLEANUP_INTERVAL_SECONDS` (default 300)
 
 Required:
 - `BOT_TOKEN` — from @BotFather
+- `ALLOWED_USER_IDS` — comma-separated positive Telegram user IDs permitted to use the private bot
 - `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` — from my.telegram.org
 - `DASHBOARD_PASSWORD` — dashboard login password
 
@@ -114,6 +115,7 @@ Commonly overridden for local dev:
 - `RECLIP_URL=http://localhost:8899`
 - `TELEGRAM_BOT_API_URL=http://localhost:8081`
 - `DOWNLOADS_PATH=./downloads`
+- `BOT_DB_PATH=./bot.db`
 - `DB_PATH=./reclip.db`
 - `SECRET_KEY=change-me` (dashboard cookie signing)
 

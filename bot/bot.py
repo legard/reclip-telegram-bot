@@ -6,10 +6,18 @@ import sys
 from telegram.ext import ApplicationBuilder
 
 from cleanup import cleanup_loop
-from handlers import register_handlers
+from handlers import allowed_user_filter, register_handlers
+from preferences import PreferenceStore
 
 LOG_FORMAT = "%(asctime)s [%(name)s] %(levelname)s: %(message)s"
 logger = logging.getLogger(__name__)
+
+
+def parse_allowed_user_ids(value: str | None) -> frozenset[int]:
+    values = (value or "").split(",")
+    if not value or any(not item.strip().isdigit() or int(item) <= 0 for item in values):
+        raise ValueError("ALLOWED_USER_IDS must contain positive integer IDs")
+    return frozenset(int(item.strip()) for item in values)
 
 
 class SecretRedactingFormatter(logging.Formatter):
@@ -74,7 +82,14 @@ def main():
         logger.error("BOT_TOKEN environment variable is required")
         sys.exit(1)
 
+    try:
+        allowed_user_ids = parse_allowed_user_ids(os.environ.get("ALLOWED_USER_IDS"))
+    except ValueError as error:
+        logger.error("%s", error)
+        sys.exit(1)
+
     api_url = os.environ.get("TELEGRAM_BOT_API_URL", "http://telegram-bot-api:8081")
+    preference_store = PreferenceStore(os.environ.get("BOT_DB_PATH", "/data/bot.db"))
 
     logger.info("Starting bot with API server: %s", api_url)
 
@@ -82,9 +97,10 @@ def main():
 
     app = build_application(bot_token, api_url)
 
-    register_handlers(app)
+    register_handlers(app, preference_store, allowed_user_ids)
 
     async def post_init(application):
+        await preference_store.initialize()
         asyncio.create_task(cleanup_loop())
         from telegram import BotCommand
         await application.bot.set_my_commands([

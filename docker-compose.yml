@@ -28,6 +28,8 @@ services:
     build: ./bot
     environment:
       - BOT_TOKEN=${BOT_TOKEN}
+      - ALLOWED_USER_IDS=${ALLOWED_USER_IDS}
+      - BOT_DB_PATH=/data/bot.db
       - RECLIP_URL=http://reclip:8899
       - TELEGRAM_BOT_API_URL=http://telegram-bot-api:8081
       - DOWNLOADS_PATH=/downloads
@@ -38,6 +40,7 @@ services:
       - DASHBOARD_URL=http://dashboard:8080
     volumes:
       - downloads:/downloads
+      - bot-data:/data
     depends_on:
       - reclip
       - telegram-bot-api
@@ -92,6 +95,7 @@ volumes:
   downloads:
   telegram-bot-api-data:
   dashboard-data:
+  bot-data:
 
 networks:
   internal:
