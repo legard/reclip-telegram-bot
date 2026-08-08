@@ -1,4 +1,5 @@
 import os
+import errno
 import uuid
 import glob
 import json
@@ -66,6 +67,9 @@ FFMPEG_TIMEOUT_EXIT_CODE = 146
 DOWNLOAD_RETRY_DELAYS = (2, 5)
 QUEUE_WAIT_TIMEOUT = 30
 SEMAPHORE_POLL_SECONDS = 0.1
+PROCESS_GROUP_TERM_GRACE_SECONDS = 5
+PROCESS_GROUP_KILL_TIMEOUT_SECONDS = 5
+PROCESS_GROUP_POLL_SECONDS = 0.05
 TERMINAL_JOB_STATUSES = frozenset({"done", "error", "cancelled"})
 URL_PATTERN = re.compile(r"https?://\S+", re.IGNORECASE)
 TOKEN_PATTERN = re.compile(
@@ -279,10 +283,10 @@ def _finish_error(job, message, *, error_code="download_failed"):
     with _job_lock(job):
         if job.get("status") in TERMINAL_JOB_STATUSES:
             return False
-        job["status"] = "error"
         job["stage"] = None
         job["error"] = message
         job["error_code"] = error_code
+        job["status"] = "error"
     _log_result(job, "error")
     return True
 
@@ -292,12 +296,12 @@ def _finish_done(job, *, file=None, file_path=None, filename=None):
     with _job_lock(job):
         if _job_stopped(job) or job.get("status") not in {"downloading", "postprocessing"}:
             return False
-        job["status"] = "done"
         job["stage"] = None
         if file is not None:
             job["file"] = file
             job["file_path"] = file_path
             job["filename"] = filename
+        job["status"] = "done"
     return True
 
 
@@ -309,9 +313,9 @@ def _finish_cancelled(job):
         if job.get("status") in {"done", "error"}:
             return False
         job["_cancelled"].set()
-        job["status"] = "cancelled"
         job["stage"] = None
         process = job.get("_active_process") or job.get("_process")
+        job["status"] = "cancelled"
     if process is not None:
         _terminate_process_group(process)
     _cleanup_job_files(job["job_id"])
@@ -319,18 +323,60 @@ def _finish_cancelled(job):
     return True
 
 
+def _process_group_exists(process_group_id):
+    try:
+        os.killpg(process_group_id, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError as error:
+        return error.errno != errno.ESRCH
+
+
+def _wait_for_process_group_exit(process, timeout):
+    """Reap the leader and wait until no descendant remains in its group."""
+    if not callable(getattr(process, "wait", None)) or not callable(
+        getattr(process, "poll", None)
+    ):
+        # Lightweight process doubles used by callers cannot be reaped or
+        # queried. Real jobs always store subprocess.Popen instances.
+        return None
+
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            process.wait(timeout=0)
+        except subprocess.TimeoutExpired:
+            pass
+        if not _process_group_exists(process.pid):
+            return True
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(PROCESS_GROUP_POLL_SECONDS, remaining))
+
+
 def _terminate_process_group(process):
     try:
         os.killpg(process.pid, signal.SIGTERM)
     except (ProcessLookupError, OSError):
         return
-    # The group leader can exit before an ffmpeg/yt-dlp child. Waiting on the
-    # leader alone would then skip SIGKILL and leave that child running.
-    time.sleep(5)
+    # The leader can exit before an ffmpeg/yt-dlp descendant. Group existence,
+    # not leader exit alone, decides whether escalation and cleanup are safe.
+    if _wait_for_process_group_exit(process, PROCESS_GROUP_TERM_GRACE_SECONDS):
+        return
     try:
         os.killpg(process.pid, signal.SIGKILL)
     except (ProcessLookupError, OSError):
-        pass
+        return
+    group_exited = _wait_for_process_group_exit(
+        process, PROCESS_GROUP_KILL_TIMEOUT_SECONDS,
+    )
+    if group_exited is False:
+        raise RuntimeError(f"Process group {process.pid} did not exit after SIGKILL")
 
 
 def expire_job(job):
@@ -340,13 +386,13 @@ def expire_job(job):
             return
         job["_timed_out"].set()
         stage = job.get("stage") or "downloading"
-        job["status"] = "error"
         job["stage"] = None
         job["error"] = (
             f"Job timed out after {_timeout_minutes()} minutes during {stage}."
         )
         job["error_code"] = "job_timeout"
         process = job.get("_active_process") or job.get("_process")
+        job["status"] = "error"
     logger.info("job_id=%s deadline_exceeded stage=%s", job["job_id"], stage)
     _log_result(job, "error")
     if process is not None:
@@ -826,20 +872,22 @@ def check_status(job_id):
     job = jobs.get(job_id)
     if not job:
         return jsonify({"error": "Job not found", "error_code": "unavailable"}), 404
-    return jsonify({
-        "status": job["status"],
-        "stage": job.get("stage"),
-        "started_at": job.get("started_at"),
-        "deadline_at": job.get("deadline_at"),
-        "error": job.get("error"),
-        "error_code": job.get("error_code"),
-        "filename": job.get("filename"),
-        "progress": job.get("progress"),
-        "file_path": job.get("file_path"),
-        "width": job.get("width"),
-        "height": job.get("height"),
-        "duration": job.get("duration"),
-    })
+    with _job_lock(job):
+        snapshot = {
+            "status": job["status"],
+            "stage": job.get("stage"),
+            "started_at": job.get("started_at"),
+            "deadline_at": job.get("deadline_at"),
+            "error": job.get("error"),
+            "error_code": job.get("error_code"),
+            "filename": job.get("filename"),
+            "progress": job.get("progress"),
+            "file_path": job.get("file_path"),
+            "width": job.get("width"),
+            "height": job.get("height"),
+            "duration": job.get("duration"),
+        }
+    return jsonify(snapshot)
 
 
 @app.route("/api/cancel/<job_id>", methods=["POST"])
@@ -860,9 +908,14 @@ def cancel_job(job_id):
 @app.route("/api/file/<job_id>")
 def download_file(job_id):
     job = jobs.get(job_id)
-    if not job or job["status"] != "done":
+    if not job:
         return jsonify({"error": "File not ready", "error_code": "file_missing"}), 404
-    return send_file(job["file"], as_attachment=True, download_name=job["filename"])
+    with _job_lock(job):
+        if job["status"] != "done":
+            return jsonify({"error": "File not ready", "error_code": "file_missing"}), 404
+        file_path = job["file"]
+        filename = job["filename"]
+    return send_file(file_path, as_attachment=True, download_name=filename)
 
 
 if __name__ == "__main__":

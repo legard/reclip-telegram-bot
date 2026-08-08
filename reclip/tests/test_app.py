@@ -2,6 +2,7 @@ from collections import deque
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 import json
+import sys
 
 import pytest
 from yt_dlp import parse_options
@@ -523,12 +524,13 @@ def test_status_exposes_active_stage_and_deadline_fields():
     job_id = "active-job"
     started_at = datetime.now(timezone.utc).isoformat()
     deadline_at = (datetime.now(timezone.utc) + timedelta(minutes=150)).isoformat()
-    app.jobs[job_id] = {
-        "status": "downloading",
-        "stage": "downloading",
-        "started_at": started_at,
-        "deadline_at": deadline_at,
-    }
+    app.jobs[job_id] = app._new_job(job_id, "https://example.com/video", "Video")
+    app.jobs[job_id].update(
+        status="downloading",
+        stage="downloading",
+        started_at=started_at,
+        deadline_at=deadline_at,
+    )
 
     try:
         response = app.app.test_client().get(f"/api/status/{job_id}")
@@ -578,8 +580,7 @@ def test_expired_job_terminates_process_group_and_removes_all_job_files(monkeypa
     assert (tmp_path / "other-job.mp4").exists()
 
 
-def test_process_group_is_killed_after_grace_when_leader_exits(monkeypatch):
-    """The process leader exiting does not prove its descendants exited."""
+def test_lightweight_process_double_still_receives_term_and_kill(monkeypatch):
     class Process:
         pid = 4242
 
@@ -590,7 +591,7 @@ def test_process_group_is_killed_after_grace_when_leader_exits(monkeypatch):
 
     app._terminate_process_group(Process())
 
-    assert sleeps == [5]
+    assert sleeps == []
     assert signals == [
         (4242, app.signal.SIGTERM),
         (4242, app.signal.SIGKILL),
@@ -1262,3 +1263,137 @@ def test_cancellation_during_ffmpeg_cannot_publish_postprocessed_file(monkeypatc
     assert job["status"] == "cancelled"
     assert "file" not in job
     assert list(tmp_path.glob("job-1.*")) == []
+
+
+@pytest.mark.parametrize("terminal_status", ["done", "error"])
+def test_status_reader_never_observes_terminal_state_without_terminal_payload(
+    terminal_status,
+):
+    terminal_published = app.threading.Event()
+    allow_writer_to_finish = app.threading.Event()
+    reader_finished = app.threading.Event()
+    response_data = {}
+
+    class PausingJob(dict):
+        def __setitem__(self, key, value):
+            super().__setitem__(key, value)
+            if key == "status" and value == terminal_status:
+                terminal_published.set()
+                assert allow_writer_to_finish.wait(timeout=1)
+
+    job = PausingJob(app._new_job("job-1", "https://example.com/video", "Video"))
+    job.update(status="downloading", stage="downloading")
+    app.jobs["job-1"] = job
+
+    def finish_job():
+        if terminal_status == "done":
+            app._finish_done(
+                job,
+                file="/downloads/job-1.mp4",
+                file_path="/downloads/job-1.mp4",
+                filename="Video.mp4",
+            )
+        else:
+            app._finish_error(job, "failed", error_code="network")
+
+    def read_status():
+        response_data.update(
+            app.app.test_client().get("/api/status/job-1").get_json(),
+        )
+        reader_finished.set()
+
+    writer = app.threading.Thread(target=finish_job)
+    reader = app.threading.Thread(target=read_status)
+    writer.start()
+    assert terminal_published.wait(timeout=1)
+    reader.start()
+
+    # An unlocked reader can finish while the writer is paused between status
+    # publication and payload publication. A locked snapshot must wait.
+    reader_finished.wait(timeout=0.1)
+    allow_writer_to_finish.set()
+    writer.join(timeout=1)
+    reader.join(timeout=1)
+    app.jobs.pop("job-1", None)
+
+    assert response_data["status"] == terminal_status
+    if terminal_status == "done":
+        assert response_data["file_path"] == "/downloads/job-1.mp4"
+        assert response_data["filename"] == "Video.mp4"
+    else:
+        assert response_data["error"] == "failed"
+        assert response_data["error_code"] == "network"
+
+
+def test_cancel_waits_for_real_process_group_exit_before_cleanup(monkeypatch, tmp_path):
+    part_path = tmp_path / "job-1.part"
+    ready_path = tmp_path / "child-ready"
+    child_code = (
+        "import os,signal,time;"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN);"
+        f"path={str(part_path)!r};"
+        f"open({str(ready_path)!r},'w').close();"
+        "\nwhile True:\n"
+        " open(path+'.tmp','w').write('late')\n"
+        " os.replace(path+'.tmp',path)\n"
+        " time.sleep(0.005)\n"
+    )
+    leader_code = (
+        "import signal,subprocess,sys,time;"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN);"
+        f"subprocess.Popen([{sys.executable!r},'-c',{child_code!r}]);"
+        "time.sleep(60)"
+    )
+    process = app.subprocess.Popen(
+        [sys.executable, "-c", leader_code],
+        start_new_session=True,
+    )
+
+    def group_exists():
+        try:
+            app.os.killpg(process.pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+
+    cleanup_group_states = []
+    original_cleanup = app._cleanup_job_files
+
+    def observed_cleanup(job_id):
+        cleanup_group_states.append(group_exists())
+        original_cleanup(job_id)
+
+    monkeypatch.setattr(app, "DOWNLOAD_DIR", str(tmp_path))
+    monkeypatch.setattr(app, "_cleanup_job_files", observed_cleanup)
+    monkeypatch.setattr(app, "PROCESS_GROUP_TERM_GRACE_SECONDS", 0.05)
+    monkeypatch.setattr(app, "PROCESS_GROUP_KILL_TIMEOUT_SECONDS", 2)
+    job = app._new_job("job-1", "https://example.com/video", "Video")
+    job.update(status="downloading", stage="downloading", _active_process=process)
+
+    try:
+        assert ready_path.exists() or _wait_for_path(ready_path)
+        assert app._finish_cancelled(job) is True
+        app.threading.Event().wait(0.05)
+
+        assert cleanup_group_states == [False]
+        assert group_exists() is False
+        assert list(tmp_path.glob("job-1.*")) == []
+    finally:
+        try:
+            app.os.killpg(process.pid, app.signal.SIGKILL)
+        except OSError:
+            pass
+        try:
+            process.wait(timeout=2)
+        except app.subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=2)
+
+
+def _wait_for_path(path, timeout=2):
+    deadline = app.time.monotonic() + timeout
+    while app.time.monotonic() < deadline:
+        if path.exists():
+            return True
+        app.threading.Event().wait(0.01)
+    return path.exists()
