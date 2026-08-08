@@ -161,22 +161,26 @@ Then access it at http://localhost:8899.
 1. You send a URL to the bot
 2. Bot sends "Fetching info..." immediately
 3. Bot calls reclip's API to get video metadata
-4. Bot displays thumbnail, title, platform, and format buttons (MP4/MP3)
-5. The bot's messages, controls, and errors are in Russian. When YouTube exposes a separate Russian track, it also displays `MP4 • RU`; it opens Russian resolutions plus `Best quality`
-6. You tap MP4 to see ordinary quality options (1080p, 720p, etc.) or MP3 for audio
-7. `MP4 • RU` downloads only the selected Russian track and never substitutes the original audio
-8. Bot starts the download and shows real-time progress
-9. Bot uploads the file to the Telegram chat
-10. Cleanup task removes old files automatically
+4. With no saved preferences, bot displays thumbnail, title, platform, and format buttons (MP4/MP3)
+5. The final manual selection persists its format, quality, and audio choice for that user
+6. Later ordinary URLs start automatically from those saved semantic preferences
+7. The bot's messages, controls, and errors are in Russian. When YouTube exposes a separate Russian track, it also displays `MP4 • RU`; it opens Russian resolutions plus `Best quality`
+8. You tap MP4 to see ordinary quality options (1080p, 720p, etc.) or MP3 for audio
+9. `MP4 • RU` downloads only the selected Russian track and never substitutes the original audio
+10. Bot starts the download and shows real-time progress
+11. Bot uploads the file to the Telegram chat
+12. Cleanup task removes old files automatically
 
 ### Commands, settings, and retries
 
 - `/mp3 <ссылка>` starts an MP3 download immediately, without the format picker.
 - `/mp4 <ссылка>` starts an MP4 download immediately in the best available
   quality, without the format picker. `/best <ссылка>` is the same one-shot
-  best-quality MP4 action.
+  best-quality MP4 action. These one-shot commands do not change saved
+  preferences.
 - `/settings` stores each user's default MP4/MP3 format, quality, and original
-  or Russian-when-available audio choice in `BOT_DB_PATH`. The **Сбросить
+  or Russian-when-available audio choice in `BOT_DB_PATH`; a final manual
+  selection for an ordinary URL saves the same preferences. The **Сбросить
   настройки** button deletes those saved preferences and returns the user to
   the defaults: MP4, best quality, and original audio.
 - Retry buttons preserve only the intended URL, format, quality, audio choice,

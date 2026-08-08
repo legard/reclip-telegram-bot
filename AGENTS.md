@@ -87,11 +87,13 @@ The bot sends fire-and-forget HTTP POSTs to `DASHBOARD_URL/api/events` with `typ
 
 ### Download Flow
 1. User sends URL → bot calls `reclip_client.get_info()`
-2. Bot shows thumbnail + format buttons (MP4 / MP3)
-3. MP4 path shows quality picker; MP3 path starts audio download directly
-4. Bot calls `start_download()` → polls `poll_status()` every 2s
-5. Progress updates edit the Telegram message in real time
-6. On `status: done`, bot uploads the file via the self-hosted Bot API
+2. With no saved preferences, bot shows thumbnail + format buttons (MP4 / MP3)
+3. The user's final manual selection persists format, quality, and audio mode
+4. Later ordinary URLs automatically start from those saved semantic preferences
+5. MP4 path shows quality picker; MP3 path starts audio download directly
+6. Bot calls `start_download()` → polls `poll_status()` every 2s
+7. Progress updates edit the Telegram message in real time
+8. On `status: done`, bot uploads the file via the self-hosted Bot API
 
 ### Post-Processing in Reclip
 - yt-dlp downloads to `DOWNLOADS_PATH/<job_id>.<ext>`
@@ -140,9 +142,10 @@ format, quality, and audio preferences across bot restarts.
   not silently replace a missing track with the original audio.
 - `/mp3 <ссылка>` downloads MP3 immediately. `/mp4 <ссылка>` downloads the
   best MP4 immediately, and `/best <ссылка>` is its one-shot alias. These
-  commands bypass the format picker.
+  commands bypass the format picker and do not change saved preferences.
 - `/settings` saves default format, quality, and audio preference in
-  `BOT_DB_PATH`. **Сбросить настройки** removes those saved values and restores
+  `BOT_DB_PATH`; the final manual selection for an ordinary URL saves the same
+  preferences. **Сбросить настройки** removes those saved values and restores
   MP4, best quality, and original audio.
 - Retry cards hold semantic intent for 24 hours and can be used once. They are
   intentionally in memory, so all outstanding retry buttons expire after a bot
