@@ -295,6 +295,7 @@ def _finish_error(job, message, *, error_code="download_failed"):
         job["error"] = message
         job["error_code"] = error_code
         job["status"] = "error"
+    _cancel_job_deadline_timer(job)
     _log_result(job, "error")
     return True
 
@@ -310,6 +311,7 @@ def _finish_done(job, *, file=None, file_path=None, filename=None):
             job["file_path"] = file_path
             job["filename"] = filename
         job["status"] = "done"
+    _cancel_job_deadline_timer(job)
     return True
 
 
@@ -354,6 +356,7 @@ def _finish_cancelled(job):
             job["_cancelled"].set()
             job["_cancel_failure"] = None
             job["_cancel_process"] = None
+        _cancel_job_deadline_timer(job)
         _log_result(job, "cancelled")
         return True
 
@@ -571,17 +574,40 @@ def _run_download_attempt(job, command):
         _clear_job_process(job, process)
 
 
+def _cancel_job_deadline_timer(job, deadline_timer=None):
+    with _job_lock(job):
+        registered_timer = job.get("_deadline_timer")
+        timer = deadline_timer or registered_timer
+        if registered_timer is timer:
+            job["_deadline_timer"] = None
+    if timer is not None:
+        timer.cancel()
+
+
+def _cancel_deadline_unless_cancel_teardown_is_pending(job, deadline_timer):
+    """Keep the hard deadline alive until requested cancellation is verified."""
+    with _job_lock(job):
+        teardown_pending = (
+            _event_is_set(job, "_cancel_requested")
+            and job.get("status") not in TERMINAL_JOB_STATUSES
+        )
+    if not teardown_pending:
+        _cancel_job_deadline_timer(job, deadline_timer)
+
+
 def _do_download(job_id, url, format_choice, format_id, audio_language=None, height=None):
     job = jobs[job_id]
 
     remaining_timeout = max(0, job["_deadline_monotonic"] - time.monotonic())
     deadline_timer = threading.Timer(remaining_timeout, expire_job, args=(job,))
     deadline_timer.daemon = True
+    with _job_lock(job):
+        job["_deadline_timer"] = deadline_timer
     deadline_timer.start()
 
     try:
         if _job_stopped(job):
-            deadline_timer.cancel()
+            _cancel_deadline_unless_cancel_teardown_is_pending(job, deadline_timer)
             return
         if audio_language == "ru":
             try:
@@ -596,10 +622,10 @@ def _do_download(job_id, url, format_choice, format_id, audio_language=None, hei
                             error, default="download_failed",
                         ),
                     )
-                deadline_timer.cancel()
+                _cancel_deadline_unless_cancel_teardown_is_pending(job, deadline_timer)
                 return
             if _job_stopped(job):
-                deadline_timer.cancel()
+                _cancel_deadline_unless_cancel_teardown_is_pending(job, deadline_timer)
                 return
             if not russian_download_available(info or {}, height):
                 _finish_error(
@@ -607,7 +633,7 @@ def _do_download(job_id, url, format_choice, format_id, audio_language=None, hei
                     RUSSIAN_AUDIO_UNAVAILABLE_ERROR,
                     error_code="russian_audio_unavailable",
                 )
-                deadline_timer.cancel()
+                _cancel_deadline_unless_cancel_teardown_is_pending(job, deadline_timer)
                 return
 
         cmd = build_download_command(job_id, url, format_choice, format_id, audio_language, height)
@@ -633,15 +659,15 @@ def _do_download(job_id, url, format_choice, format_id, audio_language=None, hei
     except Exception:
         if not _job_stopped(job):
             _finish_error(job, "Download failed")
-        deadline_timer.cancel()
+        _cancel_deadline_unless_cancel_teardown_is_pending(job, deadline_timer)
         return
 
     if _job_stopped(job):
-        deadline_timer.cancel()
+        _cancel_deadline_unless_cancel_teardown_is_pending(job, deadline_timer)
         return
 
     if returncode is None:
-        deadline_timer.cancel()
+        _cancel_deadline_unless_cancel_teardown_is_pending(job, deadline_timer)
         return
 
     try:
@@ -661,7 +687,7 @@ def _do_download(job_id, url, format_choice, format_id, audio_language=None, hei
                     error_code = "russian_audio_unavailable"
             if not _job_stopped(job):
                 _finish_error(job, error, error_code=error_code)
-            deadline_timer.cancel()
+            _cancel_deadline_unless_cancel_teardown_is_pending(job, deadline_timer)
             return
 
         files = glob.glob(os.path.join(DOWNLOAD_DIR, f"{job_id}.*"))
@@ -671,7 +697,7 @@ def _do_download(job_id, url, format_choice, format_id, audio_language=None, hei
                 "Download completed but no file was found",
                 error_code="file_missing",
             )
-            deadline_timer.cancel()
+            _cancel_deadline_unless_cancel_teardown_is_pending(job, deadline_timer)
             return
 
         if format_choice == "audio":
@@ -690,7 +716,7 @@ def _do_download(job_id, url, format_choice, format_id, audio_language=None, hei
 
         if chosen.endswith(".mp4"):
             if not _log_stage(job, "postprocessing"):
-                deadline_timer.cancel()
+                _cancel_deadline_unless_cancel_teardown_is_pending(job, deadline_timer)
                 return
             try:
                 codec_probe = _run_job_process(
@@ -701,7 +727,7 @@ def _do_download(job_id, url, format_choice, format_id, audio_language=None, hei
                     capture_output=True,
                 )
                 if _job_stopped(job):
-                    deadline_timer.cancel()
+                    _cancel_deadline_unless_cancel_teardown_is_pending(job, deadline_timer)
                     return
                 vcodec = (codec_probe.stdout or "").strip().lower()
             except Exception:
@@ -718,7 +744,7 @@ def _do_download(job_id, url, format_choice, format_id, audio_language=None, hei
                          transcoded],
                     )
                     if _job_stopped(job):
-                        deadline_timer.cancel()
+                        _cancel_deadline_unless_cancel_teardown_is_pending(job, deadline_timer)
                         return
                     if r.returncode == 0 and os.path.exists(transcoded) and os.path.getsize(transcoded) > 0:
                         os.replace(transcoded, chosen)
@@ -736,7 +762,7 @@ def _do_download(job_id, url, format_choice, format_id, audio_language=None, hei
                          "-movflags", "+faststart", faststart_tmp],
                     )
                     if _job_stopped(job):
-                        deadline_timer.cancel()
+                        _cancel_deadline_unless_cancel_teardown_is_pending(job, deadline_timer)
                         return
                     if os.path.exists(faststart_tmp) and os.path.getsize(faststart_tmp) > 0:
                         os.replace(faststart_tmp, chosen)
@@ -757,7 +783,7 @@ def _do_download(job_id, url, format_choice, format_id, audio_language=None, hei
                     capture_output=True,
                 )
                 if _job_stopped(job):
-                    deadline_timer.cancel()
+                    _cancel_deadline_unless_cancel_teardown_is_pending(job, deadline_timer)
                     return
                 info = json.loads(probe.stdout)
                 stream = (info.get("streams") or [{}])[0]
@@ -785,11 +811,11 @@ def _do_download(job_id, url, format_choice, format_id, audio_language=None, hei
         )
         if completed:
             _log_result(job, "done")
-        deadline_timer.cancel()
+        _cancel_deadline_unless_cancel_teardown_is_pending(job, deadline_timer)
     except Exception:
         if not _job_stopped(job):
             _finish_error(job, "Download failed")
-        deadline_timer.cancel()
+        _cancel_deadline_unless_cancel_teardown_is_pending(job, deadline_timer)
 
 
 def _new_job(job_id, url, title):
@@ -816,6 +842,7 @@ def _new_job(job_id, url, title):
         "_cancel_lock": threading.Lock(),
         "_cancel_process": None,
         "_cancel_failure": None,
+        "_deadline_timer": None,
         "_active_process": None,
         "_process": None,
     }

@@ -1035,6 +1035,137 @@ def test_job_deadline_retries_pending_cancel_teardown(monkeypatch, tmp_path):
     assert not partial.exists()
 
 
+def test_worker_deadline_retries_transient_cancel_cleanup_failure_without_client_retry(
+    monkeypatch, tmp_path,
+):
+    job = app._new_job("job-1", "https://example.com/video", "Video")
+    app.jobs["job-1"] = job
+    partial = tmp_path / "job-1.part"
+    partial.write_text("partial")
+    attempt_started = app.threading.Event()
+    remove_attempts = []
+    original_remove = app.os.remove
+    semaphore = app.threading.Semaphore(1)
+
+    def interrupted_attempt(current_job, command):
+        attempt_started.set()
+        assert current_job["_cancel_requested"].wait(timeout=1)
+        return 1, deque()
+
+    def transient_remove_failure(path):
+        remove_attempts.append(path)
+        if len(remove_attempts) == 1:
+            raise PermissionError("file is still in use")
+        original_remove(path)
+
+    monkeypatch.setattr(app, "JOB_TIMEOUT", 1)
+    job["_deadline_monotonic"] = app.time.monotonic() + app.JOB_TIMEOUT
+    monkeypatch.setattr(app, "DOWNLOAD_DIR", str(tmp_path))
+    monkeypatch.setattr(app, "download_semaphore", semaphore)
+    monkeypatch.setattr(app, "build_download_command", lambda *args: ["fake-download"])
+    monkeypatch.setattr(app, "_run_download_attempt", interrupted_attempt)
+    monkeypatch.setattr(app.os, "remove", transient_remove_failure)
+
+    worker = app.threading.Thread(
+        target=app.run_download,
+        args=("job-1", "https://example.com/video", "video", None),
+    )
+    worker.start()
+
+    try:
+        assert attempt_started.wait(timeout=1)
+        response = app.app.test_client().post("/api/cancel/job-1")
+        assert response.status_code == 503
+        worker.join(timeout=1)
+        assert worker.is_alive() is False
+        assert semaphore.acquire(blocking=False) is True
+        assert semaphore.acquire(blocking=False) is False
+        semaphore.release()
+
+        assert job["_cancelled"].wait(timeout=3) is True
+    finally:
+        job["_cancel_requested"].set()
+        worker.join(timeout=1)
+        app.jobs.pop("job-1", None)
+
+    assert job["status"] == "cancelled"
+    assert remove_attempts == [str(partial), str(partial)]
+    assert not partial.exists()
+
+
+def test_successful_cancel_clears_worker_deadline_after_pending_teardown_race(
+    monkeypatch,
+):
+    job = app._new_job("job-1", "https://example.com/video", "Video")
+    app.jobs["job-1"] = job
+    attempt_started = app.threading.Event()
+    cleanup_started = app.threading.Event()
+    allow_cleanup = app.threading.Event()
+    responses = []
+    timers = []
+    real_timer = app.threading.Timer
+    semaphore = app.threading.Semaphore(1)
+
+    def capture_real_timer(*args, **kwargs):
+        timer = real_timer(*args, **kwargs)
+        timers.append(timer)
+        return timer
+
+    def interrupted_attempt(current_job, command):
+        attempt_started.set()
+        assert current_job["_cancel_requested"].wait(timeout=1)
+        return 1, deque()
+
+    def blocked_successful_cleanup(job_id):
+        cleanup_started.set()
+        assert allow_cleanup.wait(timeout=1)
+
+    def cancel_from_client():
+        responses.append(app.app.test_client().post("/api/cancel/job-1"))
+
+    monkeypatch.setattr(app, "JOB_TIMEOUT", 10)
+    job["_deadline_monotonic"] = app.time.monotonic() + app.JOB_TIMEOUT
+    monkeypatch.setattr(app, "download_semaphore", semaphore)
+    monkeypatch.setattr(app, "build_download_command", lambda *args: ["fake-download"])
+    monkeypatch.setattr(app, "_run_download_attempt", interrupted_attempt)
+    monkeypatch.setattr(app, "_cleanup_job_files_strict", blocked_successful_cleanup)
+    monkeypatch.setattr(app.threading, "Timer", capture_real_timer)
+
+    worker = app.threading.Thread(
+        target=app.run_download,
+        args=("job-1", "https://example.com/video", "video", None),
+    )
+    worker.start()
+    cancel_thread = app.threading.Thread(target=cancel_from_client)
+
+    try:
+        assert attempt_started.wait(timeout=1)
+        cancel_thread.start()
+        assert cleanup_started.wait(timeout=1)
+        worker.join(timeout=1)
+        assert worker.is_alive() is False
+        assert semaphore.acquire(blocking=False) is True
+        assert semaphore.acquire(blocking=False) is False
+        semaphore.release()
+        assert timers[0].finished.is_set() is False
+
+        allow_cleanup.set()
+        cancel_thread.join(timeout=1)
+        assert cancel_thread.is_alive() is False
+        assert responses[0].status_code == 200
+        assert timers[0].finished.wait(timeout=0.5) is True
+    finally:
+        allow_cleanup.set()
+        worker.join(timeout=1)
+        cancel_thread.join(timeout=1)
+        for timer in timers:
+            timer.cancel()
+            timer.join(timeout=1)
+        app.jobs.pop("job-1", None)
+
+    assert job["status"] == "cancelled"
+
+
 def test_cancel_cleanup_failure_is_retryable_before_cancelled_is_published(
     monkeypatch, tmp_path,
 ):
