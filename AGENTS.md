@@ -168,3 +168,5 @@ format, quality, and audio preferences across bot restarts.
 - **Dashboard DB path:** `_db_path()` re-reads `DB_PATH` from env on every call so tests can override it dynamically.
 - **Reclip job state is in-memory:** `jobs = {}` in `reclip/app.py` is not persistent. Restarting reclip loses active download state.
 - **FFmpeg dependency:** The reclip Dockerfile installs ffmpeg. Locally you need it installed (`apt install ffmpeg` or equivalent).
+- **YouTube 403 after metadata succeeds:** Check the job's raw `error` at `/api/status/<job_id>` and `yt-dlp --version` inside ReClip. Version `2026.07.04` selected `android_vr` streams that returned 403; `2026.08.19` downloaded the same full MP3. A 10 KB `yt-dlp --test` can pass while the full download fails.
+- **Orange Pi updates:** Release a new multi-arch ReClip image, pin its immutable digest in `orangepi-ansible/group_vars/all/docker_services.yml`, deploy with the `reclip` tag, and verify a full Telegram MP3 download. The bot and dashboard image digests can stay pinned.

@@ -47,6 +47,7 @@ jobs:
             }
           '
           docker run --rm reclip-runtime-contract python -c 'from importlib.metadata import version; print(version("yt-dlp-ejs"))'
+          docker run --rm reclip-runtime-contract python -c 'from importlib.metadata import version; assert version("yt-dlp") == "2026.08.19"'
 
       - name: Run bot tests
         run: python -m pytest bot/tests -v
