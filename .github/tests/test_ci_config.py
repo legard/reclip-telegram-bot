@@ -168,6 +168,7 @@ def test_release_builds_and_executes_reclip_runtime_contract_image():
     assert "const minimum = [2, 3, 0]" in runtime_contract
     assert "below required 2.3.0" in runtime_contract
     assert 'version("yt-dlp-ejs")' in runtime_contract
+    assert 'from yt_dlp.version import __version__; assert __version__ == "2026.08.19"' in runtime_contract
 
 
 def test_release_is_multi_arch_and_immutable():
